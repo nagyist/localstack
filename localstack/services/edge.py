@@ -424,6 +424,12 @@ def start_proxy(
     """
     listen_hosts = parse_gateway_listen(listen_str)
     listen = listen_hosts[0]
+    return do_start_tcp_proxy(listen, target_address, asynchronous)
+
+
+def do_start_tcp_proxy(
+    listen: HostAndPort, target_address: Optional[HostAndPort] = None, asynchronous: bool = False
+) -> FuncThread:
     if target_address is None:
         target_address = HostAndPort(host=config.LOCALHOST_IP, port=constants.DEFAULT_PORT_EDGE)
 
@@ -470,18 +476,22 @@ def start_edge(listen_str: str, use_ssl: bool = True, asynchronous: bool = False
 
     # start TCP proxies for the remaining addresses
     for address in privileged:
-        # start a tcp proxy
-        run_module_as_sudo(
-            module="localstack.services.edge",
-            arguments=["proxy", "--gateway-listen", str(address)],
-            asynchronous=True,
-        )
+        if is_root():
+            # just start the proxy
+            do_start_tcp_proxy(address, asynchronous=asynchronous)
+        else:
+            # escalate to root
+            run_module_as_root(
+                module="localstack.services.edge",
+                arguments=["proxy", "--gateway-listen", str(address)],
+                asynchronous=True,
+            )
 
     if edge_thread is not None:
         edge_thread.join()
 
 
-def run_module_as_sudo(
+def run_module_as_root(
     module: str, arguments: Optional[List[str]] = None, asynchronous=False, env_vars=None
 ):
     # prepare environment
