@@ -1,5 +1,5 @@
 # builder: Stage to build a custom JRE (with jlink)
-FROM python:3.10.10-slim-buster@sha256:2425b3b12adf669291256767a3c07257ed4f3f53d26970fd44dc528b824e28dd as java-builder
+FROM python:3.11.3-slim-buster@sha256:c6218ba76d7fc3aac072a998b51e91886987777365391c4716016c1b8b2628f7 as java-builder
 ARG TARGETARCH
 
 # install OpenJDK 11
@@ -37,7 +37,7 @@ jdk.localedata --include-locales en,th \
 
 
 # base: Stage which installs necessary runtime dependencies (OS packages, java,...)
-FROM python:3.10.10-slim-buster@sha256:2425b3b12adf669291256767a3c07257ed4f3f53d26970fd44dc528b824e28dd as base
+FROM python:3.11.3-slim-buster@sha256:c6218ba76d7fc3aac072a998b51e91886987777365391c4716016c1b8b2628f7 as base
 ARG TARGETARCH
 
 # Install runtime OS package dependencies
@@ -155,7 +155,7 @@ ADD localstack/ localstack/
 RUN make entrypoints
 
 # link the extensions virtual environment into the localstack venv
-RUN echo /var/lib/localstack/lib/extensions/python_venv/lib/python3.10/site-packages > localstack-extensions-venv.pth && \
+RUN echo /var/lib/localstack/lib/extensions/python_venv/lib/python3.11/site-packages > localstack-extensions-venv.pth && \
     mv localstack-extensions-venv.pth .venv/lib/python*/site-packages/
 
 # Install the latest version of the LocalStack Persistence Plugin
