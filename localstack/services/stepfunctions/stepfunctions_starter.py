@@ -27,6 +27,7 @@ def get_command(backend_port):
         "cd %s; PORT=%s java "
         "-javaagent:aspectjweaver-1.9.7.jar "
         "-Dorg.aspectj.weaver.loadtime.configuration=META-INF/aop.xml "
+        "--add-opens=java.base/java.lang=ALL-UNNAMED "  # necessary for java17 due to https://openjdk.org/jeps/403
         "-Dcom.amazonaws.sdk.disableCertChecking -Xmx%s "
         "-jar StepFunctionsLocal.jar --aws-account %s"
     ) % (
@@ -108,7 +109,7 @@ def stop_stepfunctions():
         LOG.warning("StepFunctions process not properly terminated: %s", e)
 
 
-def check_stepfunctions(expect_shutdown: bool = False, print_error: bool = False) -> None:
+def check_stepfunctions() -> None:
     out = None
     try:
         wait_for_port_open(config.LOCAL_PORT_STEPFUNCTIONS, sleep_time=2)
@@ -116,11 +117,9 @@ def check_stepfunctions(expect_shutdown: bool = False, print_error: bool = False
         out = aws_stack.connect_to_service(
             service_name="stepfunctions", endpoint_url=endpoint_url
         ).list_state_machines()
-    except Exception:
-        if print_error:
-            LOG.exception("StepFunctions health check failed")
+    except Exception as e:
+        LOG.error(
+            "StepFunctions health check failed: %s", e, stack_info=LOG.isEnabledFor(logging.DEBUG)
+        )
 
-    if expect_shutdown:
-        assert out is None
-    else:
-        assert out and isinstance(out.get("stateMachines"), list)
+    assert out and isinstance(out.get("stateMachines"), list)
