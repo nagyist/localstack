@@ -2,10 +2,13 @@ import base64
 import json
 import logging
 import re
+import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
+from datetime import datetime
 from http import HTTPStatus
 from typing import Any, Dict, List, Union
+from urllib import parse
 from urllib.parse import urljoin
 
 import requests
@@ -16,14 +19,20 @@ from localstack import config
 from localstack.aws.accounts import get_aws_account_id
 from localstack.constants import APPLICATION_JSON, HEADER_CONTENT_TYPE
 from localstack.services.apigateway import helpers
-from localstack.services.apigateway.context import ApiInvocationContext
 from localstack.services.apigateway.helpers import (
     IntegrationParameters,
     RequestParametersResolver,
-    extract_path_params,
+    create_event_v1_integration_payload,
+    create_event_v2_integration_payload,
     extract_query_string_params,
     get_event_request_context,
     make_error_response,
+)
+from localstack.services.apigateway.models import (
+    APIGatewayProxyEvent,
+    APIGatewayProxyEventV2,
+    ApiInvocationContext,
+    BaseProxyEvent,
 )
 from localstack.services.apigateway.templates import (
     MappingTemplates,
@@ -42,9 +51,13 @@ from localstack.utils.aws.aws_responses import (
 from localstack.utils.aws.templating import VtlTemplate
 from localstack.utils.collections import dict_multi_values, remove_attributes
 from localstack.utils.common import make_http_request, to_str
-from localstack.utils.http import add_query_params_to_url, canonicalize_headers, parse_request_data
+from localstack.utils.http import (
+    add_query_params_to_url,
+    header_keys_to_lowercase,
+    parse_request_data,
+)
 from localstack.utils.json import json_safe
-from localstack.utils.strings import camel_to_snake_case, to_bytes
+from localstack.utils.strings import camel_to_snake_case, is_base64, short_uid, to_bytes
 
 LOG = logging.getLogger(__name__)
 
@@ -59,6 +72,9 @@ class BackendIntegration(ABC):
 
     @abstractmethod
     def invoke(self, invocation_context: ApiInvocationContext):
+        """
+        Entry point for invoking the backend integration.
+        """
         pass
 
     @classmethod
@@ -180,15 +196,41 @@ class LambdaProxyIntegration(BackendIntegration):
 
     @classmethod
     def construct_invocation_event(
-        cls, method, path, headers, data, query_string_params=None, is_base64_encoded=False
+        cls,
+        method,
+        path,
+        headers,
+        data,
+        query_string_params=None,
+        is_base64_encoded=False,
+        is_payload_v2=False,
     ):
         query_string_params = query_string_params or parse_request_data(method, path, "")
-
         single_value_query_string_params = {
             k: v[-1] if isinstance(v, list) else v for k, v in query_string_params.items()
         }
         # AWS canonical header names, converting them to lower-case
-        headers = canonicalize_headers(headers)
+        headers = header_keys_to_lowercase(headers)
+
+        # if content-type is not application/json or content-type is a binary mime-type,
+        # AWS encodes the body as base64
+        content_type = headers.get("content-type", "")
+        if cls.is_binary_data(content_type, data):
+            if not is_base64(data):
+                data = to_str(base64.b64encode(to_bytes(data)))
+            if data:
+                is_base64_encoded = True
+
+        if is_payload_v2:
+            return {
+                "rawPath": path,
+                "rawQueryString": parse.urlencode(query_string_params),
+                "headers": dict(headers),
+                "routeKey": f"{method} {path}",
+                "body": data,
+                "isBase64Encoded": is_base64_encoded,
+            }
+
         return {
             "path": path,
             "headers": dict(headers),
@@ -201,43 +243,85 @@ class LambdaProxyIntegration(BackendIntegration):
         }
 
     @classmethod
-    def process_apigateway_invocation(
-        cls,
-        func_arn,
-        path,
-        payload,
-        invocation_context: ApiInvocationContext,
-        query_string_params=None,
-    ) -> str:
-        if (path_params := invocation_context.path_params) is None:
-            path_params = {}
-        if (request_context := invocation_context.context) is None:
-            request_context = {}
+    def websocket_payload_event(cls, invocation: ApiInvocationContext, payload):
+        return {
+            "body": payload,
+            "isBase64Encoded": invocation.is_data_base64_encoded,
+            "requestContext": {
+                "apiId": invocation.api_id,
+                "connectedAt": int(time.time() * 1000),
+                "connectionId": invocation.connection_id,
+                "domainName": invocation.domain_name,
+                "eventType": "MESSAGE",
+                "extendedRequestId": f"{short_uid()}",
+                "identity": invocation.context.get("identity", {}),
+                "messageDirection": "IN",
+                "messageId": f"{short_uid()}",
+                "requestId": f"{short_uid()}",
+                "requestTime": f"{datetime.utcnow().strftime('%d/%b/%Y:%H:%M:%S +0000')}",
+                "requestTimeEpoch": int(time.time() * 1000),
+                "routeKey": invocation.ws_route,
+                "stage": invocation.stage,
+            },
+        }
+
+    # @classmethod
+    def process_apigateway_invocation(cls, function_arn: str, event: BaseProxyEvent) -> str:
+        # if (path_params := invocation_context.path_params) is None:
+        #     path_params = {}
+        # if (request_context := invocation_context.context) is None:
+        #     request_context = {}
         try:
-            resource_path = invocation_context.resource_path or path
-            event = cls.construct_invocation_event(
-                invocation_context.method,
-                path,
-                invocation_context.headers,
-                payload,
-                query_string_params,
-                invocation_context.is_data_base64_encoded,
-            )
-            path_params = dict(path_params)
-            cls.fix_proxy_path_params(path_params)
-            event["pathParameters"] = path_params
-            event["resource"] = resource_path
-            event["requestContext"] = request_context
-            event["stageVariables"] = invocation_context.stage_variables
-            LOG.debug(
-                "Running Lambda function %s from API Gateway invocation: %s %s",
-                func_arn,
-                invocation_context.method or "GET",
-                path,
-            )
-            asynchronous = invocation_context.headers.get("X-Amz-Invocation-Type") == "'Event'"
+            #     event = {}
+            #     if invocation_context.is_websocket_request():
+            #         event = cls.websocket_payload_event(invocation_context, payload)
+            #     else:
+            #         resource_path = invocation_context.resource_path or path
+            #         event = cls.construct_invocation_event(
+            #             invocation_context.method,
+            #             path,
+            #             invocation_context.headers,
+            #             payload,
+            #             query_string_params,
+            #             invocation_context.is_data_base64_encoded,
+            #             PayloadFormatVersion.is_v2_payload_format_version(invocation_context),
+            #         )
+            #         path_params = dict(path_params)
+            #         cls.fix_proxy_path_params(path_params)
+            #         event["version"] = (
+            #             "2.0"
+            #             if PayloadFormatVersion.is_v2_payload_format_version(invocation_context)
+            #             else "1.0"
+            #         )
+            #         event["pathParameters"] = path_params
+            #         # xXx clean this up by moving the apigateway_utils.create_integration_payload_event into community
+            #         if not PayloadFormatVersion.is_v2_payload_format_version(invocation_context):
+            #             event["resource"] = resource_path
+            #         event["requestContext"] = request_context
+            #         event["stageVariables"] = invocation_context.stage_variables
+            #         if (
+            #             PayloadFormatVersion.is_v2_payload_format_version(invocation_context)
+            #             and invocation_context.authorizer_type
+            #         ):
+            #             event["requestContext"].update(
+            #                 {
+            #                     "authorizer": {
+            #                         invocation_context.authorizer_type: invocation_context.authorizer_result
+            #                     }
+            #                 }
+            #             )
+            #         LOG.debug(
+            #             "Running Lambda function %s from API Gateway invocation: %s %s",
+            #             func_arn,
+            #             invocation_context.method or "GET",
+            #             path,
+            #         )
+
+            asynchronous = event.headers.get("X-Amz-Invocation-Type") == "'Event'"
             return call_lambda(
-                function_arn=func_arn, event=to_bytes(json.dumps(event)), asynchronous=asynchronous
+                function_arn=function_arn,
+                event=to_bytes(event.to_json()),
+                asynchronous=asynchronous,
             )
 
         except Exception as e:
@@ -252,68 +336,46 @@ class LambdaProxyIntegration(BackendIntegration):
             or invocation_context.integration.get("integrationUri")
             or ""
         )
-        invocation_context.context = get_event_request_context(invocation_context)
-        relative_path, query_string_params = extract_query_string_params(
-            path=invocation_context.path_with_query_string
-        )
-        try:
-            path_params = extract_path_params(
-                path=relative_path, extracted_path=invocation_context.resource_path
+
+        # request template rendering
+        payload = self.request_templates.render(invocation_context)
+        invocation_context.data = payload
+
+        proxy_event: BaseProxyEvent
+        if invocation_context.is_payload_v2():
+            proxy_event: APIGatewayProxyEventV2 = create_event_v2_integration_payload(
+                invocation_context
             )
-            invocation_context.path_params = path_params
-        except Exception:
-            pass
+        else:
+            proxy_event: APIGatewayProxyEvent = create_event_v1_integration_payload(
+                invocation_context
+            )
+
+        # invocation_context.context = get_event_request_context(invocation_context)
+        # relative_path, query_string_params = extract_query_string_params(
+        #     path=invocation_context.path_with_query_string
+        # )
+        # try:
+        #     path_params = extract_path_params(
+        #         path=relative_path, extracted_path=invocation_context.resource_path
+        #     )
+        #     invocation_context.path_params = path_params
+        # except Exception:
+        #     pass
 
         func_arn = uri
         if ":lambda:path" in uri:
             func_arn = uri.split(":lambda:path")[1].split("functions/")[1].split("/invocations")[0]
-
-        if invocation_context.authorizer_type:
-            invocation_context.context["authorizer"] = invocation_context.authorizer_result
-
-        payload = self.request_templates.render(invocation_context)
+        #
+        # if invocation_context.authorizer_type:
+        #     invocation_context.context["authorizer"] = invocation_context.authorizer_result
 
         result = self.process_apigateway_invocation(
-            func_arn=func_arn,
-            path=relative_path,
-            payload=payload,
-            invocation_context=invocation_context,
-            query_string_params=query_string_params,
+            function_arn=func_arn,
+            event=proxy_event,
         )
 
-        response = LambdaResponse()
-        response.headers.update({"content-type": "application/json"})
-        parsed_result = json.loads(str(result or "{}"))
-        parsed_result = common.json_safe(parsed_result)
-        parsed_result = {} if parsed_result is None else parsed_result
-
-        keys = parsed_result.keys()
-
-        if not ("statusCode" in keys and "body" in keys):
-            LOG.warning(
-                'Lambda output should follow the next JSON format: { "isBase64Encoded": true|false, "statusCode": httpStatusCode, "headers": { "headerName": "headerValue", ... },"body": "..."}'
-            )
-            response.status_code = 502
-            response._content = json.dumps({"message": "Internal server error"})
-            return response
-
-        response.status_code = int(parsed_result.get("statusCode", 200))
-        parsed_headers = parsed_result.get("headers", {})
-        if parsed_headers is not None:
-            response.headers.update(parsed_headers)
-        try:
-            result_body = parsed_result.get("body")
-            if isinstance(result_body, dict):
-                response._content = json.dumps(result_body)
-            else:
-                body_bytes = to_bytes(result_body or "")
-                if parsed_result.get("isBase64Encoded", False):
-                    body_bytes = base64.b64decode(body_bytes)
-                response._content = body_bytes
-        except Exception as e:
-            LOG.warning("Couldn't set Lambda response content: %s", e)
-            response._content = "{}"
-        response.multi_value_headers = parsed_result.get("multiValueHeaders") or {}
+        response = self.build_response(invocation_context, result)
 
         # apply custom response template
         self.update_content_length(response)
@@ -321,6 +383,68 @@ class LambdaProxyIntegration(BackendIntegration):
 
         self.response_templates.render(invocation_context)
         return invocation_context.response
+
+    def build_response(self, invocation_context, result):
+        response = LambdaResponse()
+        response.headers.update({"content-type": "application/json"})
+        parsed_result = json.loads(str(result or "{}"))
+        parsed_result = common.json_safe(parsed_result)
+        parsed_result = {} if parsed_result is None else parsed_result
+
+        if invocation_context.integration.get("PayloadFormatVersion") == "1.0":
+            keys = parsed_result.keys()
+            if not ("statusCode" in keys and "body" in keys):
+                LOG.warning(
+                    'Lambda output should follow the next JSON format: { "isBase64Encoded": true|false, "statusCode": httpStatusCode, "headers": { "headerName": "headerValue", ... },"body": "..."}'
+                )
+                response.status_code = 502
+                response._content = json.dumps({"message": "Internal server error"})
+                return response
+            response.status_code = int(parsed_result.get("statusCode", 200))
+            parsed_headers = parsed_result.get("headers", {})
+            if parsed_headers is not None:
+                response.headers.update(parsed_headers)
+            try:
+                result_body = parsed_result.get("body")
+                if isinstance(result_body, dict):
+                    response._content = json.dumps(result_body)
+                else:
+                    body_bytes = to_bytes(result_body or "")
+                    if parsed_result.get("isBase64Encoded", False):
+                        body_bytes = base64.b64decode(body_bytes)
+                    response._content = body_bytes
+            except Exception as e:
+                LOG.warning("Couldn't set Lambda response content: %s", e)
+                response._content = "{}"
+            response.multi_value_headers = parsed_result.get("multiValueHeaders") or {}
+            return response
+        else:
+            # PayloadFormatVersion 2.0 accepts string responses and inferes the response,
+            # check AWS docs for more info
+            if isinstance(parsed_result, str):
+                response.status_code = 200
+                response._content = parsed_result
+                return response
+            else:
+                if "statusCode" in parsed_result:
+                    response.status_code = parsed_result.get("statusCode")
+                else:
+                    response.status_code = 200
+                if "headers" in parsed_result:
+                    response.headers.update(parsed_result.get("headers"))
+                if "body" in parsed_result:
+                    body = parsed_result.get("body")
+                    response._content = body
+                    if parsed_result.get("isBase64Encoded", False):
+                        response._content = base64.b64decode(body)
+                else:
+                    response._content = json.dumps(parsed_result, separators=(",", ":"))
+
+                # special case for 404 - here will override any of the processing done above
+                if response.status_code == 404:
+                    response._content = json.dumps({"message": "Not Found"}, separators=(",", ":"))
+
+                return response
 
 
 class LambdaIntegration(BackendIntegration):
@@ -347,7 +471,19 @@ class LambdaIntegration(BackendIntegration):
             invocation_context.context["authorizer"] = invocation_context.authorizer_result
 
         func_arn = self._lambda_integration_uri(invocation_context)
-        event = self.request_templates.render(invocation_context) or b""
+
+        # integration type "AWS" is only supported for WebSocket APIs and REST
+        # API (v1), but the template selection expression is only supported for
+        # Websockets
+        template_key = None
+        if invocation_context.is_websocket_request():
+            template_key = invocation_context.integration.get(
+                "TemplateSelectionExpression", "$default"
+            )
+            event = self.request_templates.render(invocation_context, template_key)
+        else:
+            event = self.request_templates.render(invocation_context)
+
         asynchronous = headers.get("X-Amz-Invocation-Type", "").strip("'") == "Event"
         result = call_lambda(
             function_arn=func_arn, event=to_bytes(event), asynchronous=asynchronous
@@ -528,10 +664,7 @@ class HTTPIntegration(BackendIntegration):
     def invoke(self, invocation_context: ApiInvocationContext):
         invocation_path = invocation_context.path_with_query_string
         integration = invocation_context.integration
-        path_params = invocation_context.path_params
-        method = invocation_context.method
         headers = invocation_context.headers
-        relative_path, query_string_params = extract_query_string_params(path=invocation_path)
         uri = integration.get("uri") or integration.get("integrationUri") or ""
 
         if ":servicediscovery:" in uri:
@@ -543,21 +676,40 @@ class HTTPIntegration(BackendIntegration):
             if instance and instance.get("Id"):
                 uri = "http://%s/%s" % (instance["Id"], invocation_path.lstrip("/"))
 
-        # apply custom request template
+        # update context and stage variables
         invocation_context.context = helpers.get_event_request_context(invocation_context)
         invocation_context.stage_variables = helpers.get_stage_variables(invocation_context)
-        request_templates = RequestTemplates()
-        payload = request_templates.render(invocation_context)
+
+        template_key = APPLICATION_JSON
+        if invocation_context.is_websocket_request():
+            if "TemplateSelectionExpression" in integration:
+                tpl_expression = integration.get("TemplateSelectionExpression")
+                if tpl_expression == "\\$default":
+                    template_key = "$default"
+                else:
+                    LOG.info("Template selection expression is not fully supported")
+                    template_key = tpl_expression
+
+        payload = self.request_templates.render(invocation_context, template_key)
 
         if isinstance(payload, dict):
             payload = json.dumps(payload)
 
-        uri = apply_request_parameters(
-            uri,
-            integration=integration,
-            path_params=path_params,
-            query_params=query_string_params,
+        integration_parameters: IntegrationParameters = self.request_params_resolver.resolve(
+            invocation_context
         )
+
+        # integrationMethod is used for HTTP integrations
+        # httpMethod is used for REST integrations
+        method = integration.get("integrationMethod") or integration.get("httpMethod")
+        headers.update(integration_parameters.get("headers"))
+        query_params = integration_parameters.get("querystring")
+        path_params = integration_parameters.get("path")
+
+        for key, value in path_params.items():
+            uri = uri.replace("{%s}" % key, str(value or ""))
+
+        uri = add_query_params_to_url(uri, query_params)
         result = requests.request(method=method, url=uri, data=payload, headers=headers)
         if not result.ok:
             LOG.debug(
@@ -568,8 +720,7 @@ class HTTPIntegration(BackendIntegration):
             )
         # apply custom response template
         invocation_context.response = result
-        response_templates = ResponseTemplates()
-        response_templates.render(invocation_context)
+        self.response_templates.render(invocation_context)
         return invocation_context.response
 
 

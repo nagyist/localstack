@@ -1013,7 +1013,7 @@ def deploy_cfn_template(
 
         assert wait_until(is_change_set_created_and_available(change_set_id), _max_wait=60)
         aws_client.cloudformation.execute_change_set(ChangeSetName=change_set_id)
-        wait_result = wait_until(is_change_set_finished(change_set_id), _max_wait=max_wait or 60)
+        wait_result = wait_until(is_change_set_finished(change_set_id), _max_wait=max_wait or 120)
 
         describe_stack_res = aws_client.cloudformation.describe_stacks(StackName=stack_id)[
             "Stacks"

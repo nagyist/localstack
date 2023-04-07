@@ -9,7 +9,6 @@ from werkzeug.exceptions import NotFound
 from localstack.aws.connect import connect_to
 from localstack.constants import APPLICATION_JSON
 from localstack.services.apigateway import helpers
-from localstack.services.apigateway.context import ApiInvocationContext
 from localstack.services.apigateway.helpers import (
     EMPTY_MODEL,
     ModelResolver,
@@ -31,7 +30,7 @@ from localstack.services.apigateway.integration import (
     SQSIntegration,
     StepFunctionIntegration,
 )
-from localstack.services.apigateway.models import ApiGatewayStore
+from localstack.services.apigateway.models import ApiGatewayStore, ApiInvocationContext
 from localstack.utils.aws import aws_stack
 
 LOG = logging.getLogger(__name__)

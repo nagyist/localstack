@@ -1,3 +1,4 @@
+import base64
 import contextlib
 import copy
 import json
@@ -6,6 +7,7 @@ import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict, Union
+from urllib import parse
 from urllib import parse as urlparse
 
 from apispec import APISpec
@@ -31,9 +33,19 @@ from localstack.constants import (
     LOCALHOST_HOSTNAME,
     PATH_USER_REQUEST,
 )
-from localstack.services.apigateway.context import ApiInvocationContext
 from localstack.services.apigateway.models import (
+    APIGatewayEventIdentity,
+    APIGatewayProxyEvent,
+    APIGatewayProxyEventV2,
     ApiGatewayStore,
+    ApiInvocationContext,
+    PayloadFormatVersion,
+    RequestContext,
+    RequestContextAuthorizer,
+    RequestContextV2,
+    RequestContextV2Authorizer,
+    RequestContextV2AuthorizerIam,
+    RequestContextV2Http,
     RestApiContainer,
     apigateway_stores,
 )
@@ -43,7 +55,8 @@ from localstack.utils.aws import resources as resource_utils
 from localstack.utils.aws.arns import parse_arn
 from localstack.utils.aws.aws_responses import requests_error_response_json, requests_response
 from localstack.utils.aws.request_context import MARKER_APIGW_REQUEST_REGION, THREAD_LOCAL
-from localstack.utils.strings import long_uid, short_uid
+from localstack.utils.http import header_keys_to_lowercase
+from localstack.utils.strings import is_base64, long_uid, short_uid, to_bytes, to_str
 from localstack.utils.time import TIMESTAMP_FORMAT_TZ, timestamp
 from localstack.utils.urls import localstack_host
 
@@ -340,6 +353,7 @@ class RequestParametersResolver:
     """
     Integration request data mapping expressions
     https://docs.aws.amazon.com/apigateway/latest/developerguide/request-response-data-mappings.html
+    https://docs.aws.amazon.com/apigateway/latest/developerguide/websocket-api-data-mapping.html
     """
 
     def resolve(self, context: ApiInvocationContext) -> IntegrationParameters:
@@ -351,8 +365,22 @@ class RequestParametersResolver:
 
         :return: IntegrationParameters
         """
-        method_request_params: Dict[str, Any] = self.method_request_dict(context)
 
+        if context.is_websocket_request():
+            sourced_request_params: Dict[str, Any] = self.route_request_dict(context)
+        else:
+            sourced_request_params: Dict[str, Any] = self.method_request_dict(context)
+
+        # For WebSocket requests, the request parameters are source from the route request parameters.
+        #
+        # requestParameters: {
+        #    "integration.request.path.pathParam": "route.request.header.Content-Type"
+        #    "integration.request.querystring.who": "route.request.querystring.who",
+        #    "integration.request.header.Content-Type": "'application/json'",
+        # }
+        #
+        # For REST requests, the request parameters are source from the method request parameters.
+        #
         # requestParameters: {
         #     "integration.request.path.pathParam": "method.request.header.Content-Type"
         #     "integration.request.querystring.who": "method.request.querystring.who",
@@ -364,8 +392,8 @@ class RequestParametersResolver:
         # request parameters
         integrations_parameters = {}
         for k, v in request_params.items():
-            if v.lower() in method_request_params:
-                integrations_parameters[k] = method_request_params[v.lower()]
+            if v.lower() in sourced_request_params:
+                integrations_parameters[k] = sourced_request_params[v.lower()]
             else:
                 # static values
                 integrations_parameters[k] = v.replace("'", "")
@@ -398,7 +426,6 @@ class RequestParametersResolver:
         """
         params: Dict[str, str] = {}
 
-        # TODO: add support for context variables - include in apiinvocationcontext
         # TODO: add support for multi-values headers and multi-values querystring
 
         for k, v in context.query_params().items():
@@ -413,10 +440,250 @@ class RequestParametersResolver:
         for k, v in context.stage_variables.items():
             params[f"stagevariables.{k}"] = v
 
+        for k, v in context.context.items():
+            params[f"context.{k}"] = v
+
         if context.data:
             params["method.request.body"] = context.data
 
         return {key.lower(): val for key, val in params.items()}
+
+    def route_request_dict(self, context):
+        """
+        Build a dict with all route request parameters and their values.
+
+        :return: dict with all route request parameters and their values,
+        and all keys in lowercase
+        """
+        params: Dict[str, str] = {}
+
+        # TODO: headers, querystring is only available for the route $connect
+        # TODO: add support for context variables - include in apiinvocationcontext
+        # TODO: add support for multi-values headers and multi-values querystring
+
+        for k, v in context.query_params().items():
+            params[f"route.request.querystring.{k}"] = v
+
+        for k, v in context.headers.items():
+            params[f"route.request.header.{k}"] = v
+
+        for k, v in context.path_params.items():
+            params[f"route.request.path.{k}"] = v
+
+        for k, v in context.stage_variables.items():
+            params[f"stagevariables.{k}"] = v
+
+        if context.data:
+            params["route.request.body"] = context.data
+
+        return {key.lower(): val for key, val in params.items()}
+
+
+def is_binary_data(content_type):
+    if content_type.startswith("text/"):
+        # If the content type starts with "text/", assume it's text data
+        return False
+    elif content_type == "application/json":
+        return False
+    else:
+        # For all other content types, assume it's binary data
+        return True
+
+
+def create_event_v1_integration_payload(
+    invocation_context: ApiInvocationContext,
+) -> APIGatewayProxyEvent:
+    """
+    The payload format version 1 that API Gateway sends to a Lambda integration.
+    https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-develop-integrations-lambda.html
+
+    :param invocation_context:
+    :return: dictionary formatted according to v1 spec
+    """
+
+    headers = header_keys_to_lowercase(invocation_context.headers)
+    data = invocation_context.data_as_string()
+    is_base64_encoded = False
+
+    content_type = headers.get("content-type", "")
+    if is_binary_data(content_type):
+        if not is_base64(data):
+            data = to_str(base64.b64encode(to_bytes(data)))
+            if data:
+                is_base64_encoded = True
+
+    event: APIGatewayProxyEvent = APIGatewayProxyEvent()
+    event.body = data
+    event.version = invocation_context.payload_format_version.V1.value
+    event.resource = invocation_context.invocation_path
+    event.http_method = invocation_context.method
+    event.path = f"/{invocation_context.stage}{invocation_context.path}"
+    event.headers = dict(headers)
+    event.multi_value_headers = dict([(k, [v]) for k, v in headers.items()])
+    event.is_base64_encoded = is_base64_encoded
+    event.path_parameters = dict(invocation_context.path_params)
+    event.query_string_parameters = dict(invocation_context.query_params()) or None
+    event.multi_value_query_string_parameters = {
+        k: [v] for k, v in dict(invocation_context.query_params()).items()
+    } or None
+    event.stage_variables = invocation_context.stage_variables or None
+    event.resource = (
+        invocation_context.resource_path.split(" ")[1]
+        if len(invocation_context.resource_path.split(" ")) > 1
+        else invocation_context.resource_path
+    )
+    event.request_context = get_event_request_context(invocation_context)
+    return event
+    # message = invocation_context.data
+    # headers = header_keys_to_lowercase(invocation_context.headers)
+    # path_without_params, _, query_string = invocation_context.path.partition("?")
+    #
+    # # construct basic request context
+    # req_context = get_event_request_context(invocation_context)
+    #
+    # # update identity details
+    # identity = req_context.setdefault("identity", {})
+    # identity.update({"sourceIp": "127.0.0.1"})
+    # identity.update(invocation_context.auth_identity or {})
+    #
+    # authorizer_context = _get_authorizer_context(invocation_context, PayloadFormatVersion.V1)
+    #
+    # action = message.get("action") if isinstance(message, dict) else "$default"
+    # event_type = (
+    #     "CONNECT"
+    #     if action == "$connect"
+    #     else "DISCONNECT"
+    #     if action == "$disconnect"
+    #     else "MESSAGE"
+    # )
+    # req_context["authorizer"] = authorizer_context
+    # req_context["path"] = path_without_params
+    # req_context["routeKey"] = action
+    # req_context["messageId"] = None
+    # req_context["eventType"] = event_type
+    # req_context["version"] = (
+    #     invocation_context.integration["payloadFormatVersion"]
+    #     if invocation_context.integration is not None
+    #        and "payloadFormatVersion" in invocation_context.integration
+    #     else "1.0"
+    # )
+    # query_params = parse_qs(query_string, keep_blank_values=True)
+    # query_params = dict([(k, v[0]) for k, v in query_params.items()])
+    # return {
+    #     "version": req_context["version"],
+    #     "resource": invocation_context.invocation_path,
+    #     "httpMethod": invocation_context.method,
+    #     "path": invocation_context.path,
+    #     "body": message,
+    #     "headers": dict(headers),
+    #     "multiValueHeaders": dict([(k, [v]) for k, v in headers.items()]),
+    #     "requestContext": req_context,
+    #     "isBase64Encoded": False,
+    #     "queryStringParameters": query_params,
+    #     "multiValueQueryStringParameters": {k: [v] for k, v in query_params.items()},
+    #     "pathParameters": invocation_context.path_params,
+    #     "stageVariables": {},
+    # }
+
+
+def create_event_v2_integration_payload(
+    invocation_context: ApiInvocationContext,
+) -> APIGatewayProxyEventV2:
+    """
+    The payload format version 2 that API Gateway sends to a Lambda integration.
+    https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-develop-integrations-lambda.html
+
+    :param invocation_context:
+    :return: dictionary formatted according to v2 spec
+    """
+    headers = header_keys_to_lowercase(invocation_context.headers)
+    stage = invocation_context.stage
+    relative_path, query_string_params = extract_query_string_params(
+        path=invocation_context.path_with_query_string
+    )
+    path_without_params, _, query_string = invocation_context.path.partition("?")
+    data = invocation_context.data_as_string()
+    is_base64_encoded = False
+
+    content_type = headers.get("content-type", "")
+    if is_binary_data(content_type):
+        if not is_base64(data):
+            data = to_str(base64.b64encode(to_bytes(data)))
+        if data:
+            is_base64_encoded = True
+
+    event: APIGatewayProxyEventV2 = APIGatewayProxyEventV2()
+    event.version = "2.0"
+    event.route_key = invocation_context.resource_path
+    event.raw_path = f"/{stage}{invocation_context.invocation_path}"
+    event.raw_query_string = parse.urlencode(query_string_params)
+    event.headers = headers
+    event.body = invocation_context.data
+    event.request_context = get_event_request_context(invocation_context)
+    event.is_base64_encoded = is_base64_encoded
+    if invocation_context.stage_variables:
+        event.stage_variables = invocation_context.stage_variables
+    event.path_parameters = invocation_context.path_params
+
+    if invocation_context.cookies():
+        event.cookies = invocation_context.cookies()
+    return event
+
+
+def _get_authorizer_context(
+    invocation_context: ApiInvocationContext, version: PayloadFormatVersion
+) -> RequestContextV2Authorizer | RequestContextAuthorizer:
+
+    if not invocation_context.authorizer_type:
+        return {}
+    result = invocation_context.authorizer_result or {}
+
+    # select scopes for authorizer payload
+    scopes = result.get("scopes") or None
+    # TODO: not yet working for WebSockets - look into unifying `route` and `ws_route` in invocation context
+    route_scopes = (
+        invocation_context.route and invocation_context.route.get("AuthorizationScopes") or []
+    )
+    if not route_scopes:
+        # AWS parity - scopes in payload are null when route has no auth scopes defined
+        scopes = None
+
+    if non_satisfied_scopes := [rs for rs in route_scopes if rs not in (scopes or [])]:
+        raise Exception(
+            f"Found non-satisfied scopes {non_satisfied_scopes} ({route_scopes} < {scopes})"
+        )
+
+    ctx_authorizer = RequestContextAuthorizer()
+    if invocation_context.authorizer_type == "jwt" or version == PayloadFormatVersion.V1:
+        ctx_authorizer.claims = invocation_context.auth_context.get("claims")
+        ctx_authorizer.scopes = scopes
+
+    # wrap result in authorizer type key for v2 payloads
+    # https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-develop-integrations-lambda.html
+    # v2
+    # "authorizer": {
+    #       "jwt": {
+    #         "claims": {},
+    #         "scopes": []
+    #       }
+    # }
+    #
+    # v1
+    # "authorizer": {
+    #       "claims": null,
+    #       "scopes": null
+    #     }
+    #
+    if version == PayloadFormatVersion.V2:
+        ctx_authorizer = RequestContextV2Authorizer()
+        match invocation_context.authorizer_type:
+            case "jwt":
+                ctx_authorizer.jwt = result
+            case "lambda":
+                ctx_authorizer.custom = result
+            case "iam":
+                ctx_authorizer.iam = RequestContextV2AuthorizerIam()
+    return ctx_authorizer
 
 
 def resolve_references(data: dict, rest_api_id, allow_recursive=True) -> dict:
@@ -1193,13 +1460,14 @@ def get_target_resource_method(invocation_context: ApiInvocationContext) -> Opti
     )
 
 
-def get_event_request_context(invocation_context: ApiInvocationContext):
+def get_event_request_context(
+    invocation_context: ApiInvocationContext,
+) -> RequestContext | RequestContextV2:
     method = invocation_context.method
     path = invocation_context.path
     headers = invocation_context.headers
     integration_uri = invocation_context.integration_uri
     resource_path = invocation_context.resource_path
-    resource_id = invocation_context.resource_id
 
     set_api_id_stage_invocation_path(invocation_context)
     relative_path, query_string_params = extract_query_string_params(
@@ -1208,42 +1476,101 @@ def get_event_request_context(invocation_context: ApiInvocationContext):
     api_id = invocation_context.api_id
     stage = invocation_context.stage
 
-    source_ip = headers.get("X-Forwarded-For", ",").split(",")[-2].strip()
+    source_ip = headers.get("X-Forwarded-For", ",").split(",")[-2].strip() or "127.0.0.1"
     integration_uri = integration_uri or ""
     account_id = integration_uri.split(":lambda:path")[-1].split(":function:")[0].split(":")[-1]
     account_id = account_id or get_aws_account_id()
-    request_context = {
-        "accountId": account_id,
-        "apiId": api_id,
-        "resourcePath": resource_path or relative_path,
-        "domainPrefix": invocation_context.domain_prefix,
-        "domainName": invocation_context.domain_name,
-        "resourceId": resource_id,
-        "requestId": long_uid(),
-        "identity": {
-            "accountId": account_id,
-            "sourceIp": source_ip,
-            "userAgent": headers.get("User-Agent"),
-        },
-        "httpMethod": method,
-        "protocol": "HTTP/1.1",
-        "requestTime": datetime.now(timezone.utc).strftime(REQUEST_TIME_DATE_FORMAT),
-        "requestTimeEpoch": int(time.time() * 1000),
-        "authorizer": {},
-    }
+
+    if invocation_context.is_payload_v2():
+        request_context = RequestContextV2()
+        request_context.account_id = account_id
+        request_context.api_id = api_id
+        request_context.domain_name = invocation_context.domain_name
+        request_context.domain_prefix = invocation_context.domain_prefix
+        request_context.http = RequestContextV2Http()
+        request_context.http.method = method
+        request_context.http.path = f"/{stage}{relative_path}"
+        request_context.http.protocol = "HTTP/1.1"
+        request_context.http.source_ip = source_ip
+        request_context.http.user_agent = headers.get("User-Agent")
+        request_context.request_id = long_uid()
+        request_context.route_key = invocation_context.resource_path
+        request_context.stage = stage
+        request_context.time = datetime.now(timezone.utc).strftime(REQUEST_TIME_DATE_FORMAT)
+        request_context.time_epoch = int(time.time() * 1000)
+
+        if invocation_context.authorizer_type:
+            request_context.authorizer = (
+                _get_authorizer_context(invocation_context, PayloadFormatVersion.V2) or None
+            )
+
+        return request_context
+
+    request_context = RequestContext()
+    request_context.account_id = account_id
+    request_context.api_id = api_id
+    request_context.path = f"/{stage}{relative_path}"
+    request_context.stage = stage
+    request_context.domain_prefix = invocation_context.domain_prefix
+    request_context.domain_name = invocation_context.domain_name
+    request_context.resource_id = invocation_context.resource_path
+    request_context.resource_path = (
+        invocation_context.resource_path.split(" ")[1]
+        if len(resource_path.split(" ")) > 1
+        else invocation_context.resource_path
+    )
+    request_context.request_id = long_uid()
+    request_context.extended_request_id = long_uid()
+    request_context.http_method = method
+    request_context.protocol = "HTTP/1.1"
+    request_context.request_time = datetime.now(timezone.utc).strftime(REQUEST_TIME_DATE_FORMAT)
+    request_context.request_time_epoch = int(time.time() * 1000)
+    request_context.identity = APIGatewayEventIdentity()
+    request_context.identity.source_ip = source_ip
+    request_context.identity.user_agent = headers.get("User-Agent")
+    request_context.identity.access_key = None
+    request_context.identity.account_id = None
+    request_context.identity.caller = None
+    request_context.identity.cognito_authentication_provider = None
+    request_context.identity.cognito_authentication_type = None
+    request_context.identity.cognito_identity_id = None
+    request_context.identity.cognito_identity_pool_id = None
+    request_context.identity.principal_org_id = None
+    request_context.identity.user = None
+    request_context.identity.user_arn = None
+    request_context.identity.cognito_amr = None
+    return request_context
+
+    # request_context.authorizer = {}
+    # request_context = {
+    #     "accountId": account_id,
+    #     "apiId": api_id,
+    #     "resourcePath": resource_path or relative_path,
+    #     "domainPrefix": invocation_context.domain_prefix,
+    #     "domainName": invocation_context.domain_name,
+    #     "resourceId": resource_id,
+    #     "requestId": long_uid(),
+    #     "identity": {
+    #         "sourceIp": source_ip,
+    #         "userAgent": headers.get("User-Agent"),
+    #     },
+    #     "httpMethod": method,
+    #     "protocol": "HTTP/1.1",
+    #     "requestTime": datetime.now(timezone.utc).strftime(REQUEST_TIME_DATE_FORMAT),
+    #     "requestTimeEpoch": int(time.time() * 1000),
+    #     "authorizer": {},
+    # }
 
     if invocation_context.is_websocket_request():
-        request_context["connectionId"] = invocation_context.connection_id
+        request_context.connection_id = invocation_context.connection_id
 
-    # set "authorizer" and "identity" event attributes from request context
-    authorizer_result = invocation_context.authorizer_result
-    if authorizer_result:
-        request_context["authorizer"] = authorizer_result
-    request_context["identity"].update(invocation_context.auth_identity or {})
+    if authorizer_result := invocation_context.authorizer_result:
+        request_context.authorizer = authorizer_result
+    # request_context.identity.update(invocation_context.auth_identity or {})
 
     if not is_test_invoke_method(method, path):
-        request_context["path"] = (f"/{stage}" if stage else "") + relative_path
-        request_context["stage"] = stage
+        request_context.path = (f"/{stage}" if stage else "") + relative_path
+        request_context.stage = stage
     return request_context
 
 

@@ -178,16 +178,19 @@ class TransformerUtility:
     @staticmethod
     def apigatewayv2_lambda_proxy_event():
         return [
-            TransformerUtility.key_value("resourceId"),
             TransformerUtility.key_value("sourceIp"),
             TransformerUtility.jsonpath("$..requestContext.accountId", "account-id"),
-            TransformerUtility.jsonpath("$..requestContext.apiId", "api-id"),
             TransformerUtility.jsonpath("$..requestContext.domainName", "domain-name"),
             TransformerUtility.jsonpath("$..requestContext.domainPrefix", "domain-prefix"),
             TransformerUtility.jsonpath(
-                "$..requestContext.extendedRequestId", "extended-request-id"
+                "$..requestContext.requestId", "request-id", reference_replacement=False
             ),
-            TransformerUtility.jsonpath("$..requestContext.requestId", "request-id"),
+            TransformerUtility.jsonpath(
+                "$..requestContext.extendedRequestId",
+                "extended-request-id",
+                reference_replacement=False,
+            ),
+            TransformerUtility.jsonpath("$..requestContext.apiId", "api-id"),
             TransformerUtility.jsonpath(
                 "$..requestContext.requestTime",
                 value_replacement="<request-time>",
@@ -218,7 +221,9 @@ class TransformerUtility:
                 "$..multiValueHeaders.X-Amzn-Trace-Id[*]", "x-amzn-trace-id"
             ),
             TransformerUtility.jsonpath("$..multiValueHeaders.authorization[*]", "authorization"),
-            TransformerUtility.jsonpath("$..multiValueHeaders.User-Agent[*]", "user-agent"),
+            TransformerUtility.jsonpath(
+                "$..multiValueHeaders.User-Agent[*]", "user-agent", reference_replacement=False
+            ),
             TransformerUtility.regex(r"python-requests/\d+\.\d+(\.\d+)?", "python-requests/x.x.x"),
         ]
 

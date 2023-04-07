@@ -8,7 +8,7 @@ from urllib.parse import quote_plus, unquote_plus
 
 from localstack import config
 from localstack.constants import APPLICATION_JSON
-from localstack.services.apigateway.context import ApiInvocationContext
+from localstack.services.apigateway.models import ApiInvocationContext
 from localstack.utils.aws.templating import VelocityUtil, VtlTemplate
 from localstack.utils.json import extract_jsonpath, json_safe
 from localstack.utils.strings import to_str

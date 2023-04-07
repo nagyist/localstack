@@ -173,6 +173,12 @@ def keys_to_lower(obj: ComplexType, skip_children_of: List[str] = None) -> Compl
     return result
 
 
+def snake_to_camel(snake_str: str) -> str:
+    components = snake_str.split("_")
+    # capitalize the first letter of each component except the first one
+    return components[0] + "".join(x.title() for x in components[1:])
+
+
 def singleton_factory(factory: Callable[[], _T]) -> Callable[[], _T]:
     """
     Decorator for methods that create a particular value once and then return the same value in a thread safe way.

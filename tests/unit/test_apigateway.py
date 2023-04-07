@@ -715,7 +715,7 @@ class TestRequestParameterResolver:
                 "integration.request.path.pathParam": "method.request.path.id",
                 "integration.request.querystring.baz": "method.request.querystring.baz",
                 "integration.request.querystring.token": "method.request.header.Authorization",
-                "integration.request.querystring.env": "stageVariables.enviroment",
+                "integration.request.querystring.env": "stageVariables.environment",
                 "integration.request.header.Content-Type": "'application/json'",
                 "integration.request.header.body-header": "method.request.body",
             }
@@ -730,7 +730,7 @@ class TestRequestParameterResolver:
         )
         context.path_params = {"id": "bar"}
         context.integration = integration
-        context.stage_variables = {"enviroment": "dev"}
+        context.stage_variables = {"environment": "dev"}
         resolver = RequestParametersResolver()
         result = resolver.resolve(context)
 

@@ -6,6 +6,8 @@ from urllib.parse import urlparse
 import pytest
 import requests
 from botocore.exceptions import ClientError
+from werkzeug import Request
+from werkzeug import Response as WerkzeugResponse
 
 from localstack import config
 from localstack.aws.accounts import get_aws_account_id
@@ -24,7 +26,7 @@ from tests.integration.apigateway.conftest import DEFAULT_STAGE_NAME
 from tests.integration.awslambda.test_lambda import TEST_LAMBDA_LIBS
 
 
-def test_http_integration(create_rest_apigw, aws_client, echo_http_server):
+def test_http_integration(create_rest_apigw, aws_client, httpserver):
     api_id, _, root_id = create_rest_apigw(name="my_api", description="this is my api")
 
     aws_client.apigateway.put_method(
@@ -35,12 +37,21 @@ def test_http_integration(create_rest_apigw, aws_client, echo_http_server):
         restApiId=api_id, resourceId=root_id, httpMethod="GET", statusCode="200"
     )
 
+    def _handler(_request: Request) -> WerkzeugResponse:
+        response_content = {"foo": "bar"}
+        return WerkzeugResponse(
+            json.dumps(response_content), mimetype="application/json", status=200
+        )
+
+    httpserver.expect_request("").respond_with_handler(_handler)
+    uri = httpserver.url_for("/")
+
     aws_client.apigateway.put_integration(
         restApiId=api_id,
         resourceId=root_id,
         httpMethod="GET",
         type="HTTP",
-        uri=echo_http_server,
+        uri=uri,
         integrationHttpMethod="GET",
     )
 
@@ -51,6 +62,7 @@ def test_http_integration(create_rest_apigw, aws_client, echo_http_server):
     response = requests.get(url)
 
     assert response.status_code == 200
+    assert response.json() == {"foo": "bar"}
 
 
 @pytest.mark.aws_validated
