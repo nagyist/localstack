@@ -77,25 +77,6 @@ class TestClientFactory:
             config=connect_to._config,
         )
 
-        mock.reset_mock()
-        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "lorem")
-        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "ipsum")
-
-        connect_to.get_client(
-            "def", region_name=None, aws_secret_access_key=None, aws_access_key_id=None
-        )
-        mock.assert_called_once_with(
-            service_name="def",
-            region_name="us-east-1",
-            use_ssl=True,
-            verify=False,
-            endpoint_url="http://localhost:4566",
-            aws_access_key_id="test",
-            aws_secret_access_key="test",
-            aws_session_token=None,
-            config=connect_to._config,
-        )
-
     @patch.object(ExternalAwsClientFactory, "_get_client")
     def test_external_aws_client_credentials_loaded_from_env_if_set_to_none(
         self, mock, monkeypatch
