@@ -150,7 +150,8 @@ try:
 except Exception:
     MAX_POOL_CONNECTIONS = 150
 
-TEST_AWS_REGION_NAME = "us-east-1"
+# AWS region used by the test suite
+TEST_AWS_REGION_NAME = "us-west-2"
 
 # credentials used in the test suite
 TEST_AWS_ACCOUNT_ID = "000000000001"
