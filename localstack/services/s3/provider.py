@@ -384,13 +384,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
             response["ContentEncoding"] = ""
 
         if request.get("ChecksumMode") == "ENABLED" and checksum_algorithm:
-            # TODO: moto does not store the checksum of object, there is a TODO there as well
-            # in the meantime, just compute the hash everytime it's requested
-            checksum = get_object_checksum_for_algorithm(
-                checksum_algorithm=checksum_algorithm,
-                data=key_object.value,
-            )
-            response[f"Checksum{checksum_algorithm.upper()}"] = checksum  # noqa
+            response[f"Checksum{checksum_algorithm.upper()}"] = key_object.checksum_value  # noqa
 
         response["AcceptRanges"] = "bytes"
         return response
@@ -443,6 +437,15 @@ class S3Provider(S3Api, ServiceLifecycleHook):
             )
             response["SSEKMSKeyId"] = key_object.kms_key_id
 
+        if key_object.checksum_algorithm == "CRC32C" and "ChecksumCRC32C" not in request:
+            # recalculate the checksum, as moto does not handle CRC32C yet and uses CRC32
+            checksum_value = get_object_checksum_for_algorithm(
+                checksum_algorithm=checksum_algorithm,
+                data=key_object.value,
+            )
+            key_object.checksum_value = checksum_value
+            response["ChecksumCRC32C"] = checksum_value
+
         self._notify(context)
 
         return response
@@ -453,12 +456,22 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         context: RequestContext,
         request: CopyObjectRequest,
     ) -> CopyObjectOutput:
+        moto_backend = get_moto_s3_backend(context)
+        dest_bucket = get_bucket_from_moto(moto_backend, bucket=request["Bucket"])
         if not config.S3_SKIP_KMS_KEY_VALIDATION and (sse_kms_key_id := request.get("SSEKMSKeyId")):
-            moto_backend = get_moto_s3_backend(context)
-            bucket = get_bucket_from_moto(moto_backend, bucket=request["Bucket"])
-            validate_kms_key_id(sse_kms_key_id, bucket)
+            validate_kms_key_id(sse_kms_key_id, dest_bucket)
 
         response: CopyObjectOutput = call_moto(context)
+
+        if request.get("ChecksumAlgorithm") == "CRC32C":
+            # recalculate the checksum, as moto does not handle CRC32C yet and uses CRC32
+            dest_key_object = get_key_from_moto_bucket(dest_bucket, key=request["Key"])
+            checksum = get_object_checksum_for_algorithm(
+                checksum_algorithm="CRC32C",
+                data=dest_key_object.value,
+            )
+            response["CopyObjectResult"]["ChecksumCRC32C"] = checksum
+
         self._notify(context)
         return response
 
@@ -1111,7 +1124,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
 
         object_attrs = request.get("ObjectAttributes", [])
         response = GetObjectAttributesOutput()
-        # TODO: see Checksum field
+
         if "ETag" in object_attrs:
             response["ETag"] = key.etag.strip('"')
         if "StorageClass" in object_attrs:
@@ -1119,13 +1132,9 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         if "ObjectSize" in object_attrs:
             response["ObjectSize"] = key.size
         if "Checksum" in object_attrs and (checksum_algorithm := key.checksum_algorithm):
-            # TODO: moto does not store the checksum of object, there is a TODO there as well
-            # in the meantime, just compute the hash everytime it's requested
-            checksum = get_object_checksum_for_algorithm(
-                checksum_algorithm=checksum_algorithm,
-                data=key.value,
-            )
-            response["Checksum"] = {f"Checksum{checksum_algorithm.upper()}": checksum}  # noqa
+            response["Checksum"] = {  # noqa
+                f"Checksum{checksum_algorithm.upper()}": key.checksum_value
+            }
 
         response["LastModified"] = key.last_modified
 
