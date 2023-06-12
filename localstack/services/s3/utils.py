@@ -1,30 +1,38 @@
 import datetime
 import re
-from typing import Dict, Literal, Optional, Tuple, Union
+from typing import Dict, Literal, Optional, Tuple, Type, Union
 
 import moto.s3.models as moto_s3_models
 from botocore.exceptions import ClientError
 from botocore.utils import InvalidArnException
 from moto.s3.exceptions import MissingBucket
 from moto.s3.models import FakeBucket, FakeDeleteMarker, FakeKey
+from werkzeug.datastructures.headers import Headers
 
-from localstack.aws.api import CommonServiceException, ServiceException
+from localstack import config
+from localstack.aws.api import CommonServiceException
 from localstack.aws.api.s3 import (
     BucketName,
     ChecksumAlgorithm,
     InvalidArgument,
+    Metadata,
     MethodNotAllowed,
     NoSuchBucket,
     NoSuchKey,
     ObjectKey,
+    Owner,
 )
 from localstack.services.s3.constants import (
+    METADATA_SETTABLE_HEADERS,
     S3_VIRTUAL_HOST_FORWARDED_HEADER,
     VALID_CANNED_ACLS_BUCKET,
 )
+from localstack.services.s3.exceptions import InvalidRequest
+from localstack.services.s3.models_v2 import S3Bucket
 from localstack.utils.aws import arns, aws_stack
 from localstack.utils.aws.arns import parse_arn
 from localstack.utils.strings import checksum_crc32, checksum_crc32c, hash_sha1, hash_sha256
+from localstack.utils.urls import localstack_host
 
 checksum_keys = ["ChecksumSHA1", "ChecksumSHA256", "ChecksumCRC32", "ChecksumCRC32C"]
 
@@ -50,10 +58,15 @@ PATTERN_UUID = re.compile(
 )
 
 
-class InvalidRequest(ServiceException):
-    code: str = "InvalidRequest"
-    sender_fault: bool = False
-    status_code: int = 400
+def get_full_default_bucket_location(bucket_name):
+    if config.HOSTNAME_EXTERNAL != config.LOCALHOST:
+        host_definition = localstack_host(
+            use_hostname_external=True, custom_port=config.get_edge_port_http()
+        )
+        return f"{config.get_protocol()}://{host_definition.host_and_port()}/{bucket_name}/"
+    else:
+        host_definition = localstack_host(use_localhost_cloud=True)
+        return f"{config.get_protocol()}://{bucket_name}.s3.{host_definition.host_and_port()}/"
 
 
 def get_object_checksum_for_algorithm(checksum_algorithm: str, data: bytes):
@@ -120,6 +133,39 @@ def is_valid_canonical_id(canonical_id: str) -> bool:
         return int(canonical_id, 16) and len(canonical_id) == 64
     except ValueError:
         return False
+
+
+def get_class_attrs_from_spec_class(spec_class: Type[str]):
+    return {attr for attr in vars(spec_class) if not attr.startswith("__")}
+
+
+def get_metadata_from_headers(headers: Headers) -> Metadata:
+    metadata = Metadata()
+    meta_regex = re.compile(r"^x-amz-meta-([a-zA-Z0-9\-_.]+)$", flags=re.IGNORECASE)
+
+    for header in headers.keys():
+        if isinstance(header, str):
+            result = meta_regex.match(header)
+            meta_key = None
+            if result:
+                # Check for extra metadata
+                meta_key = result.group(0).lower()
+            elif header.lower() in METADATA_SETTABLE_HEADERS:
+                # Check for special metadata that doesn't start with x-amz-meta
+                meta_key = header
+            # TODO: test multiple values for headers
+            if meta_key:
+                metadata[meta_key] = (
+                    headers[header][0] if type(headers[header]) == list else headers[header]
+                )
+    return metadata
+
+
+def get_owner_for_account_id(account_id: str):
+    return Owner(
+        DisplayName="webfile",  # only in certain regions, see above
+        ID="75aa57f09aa0c8caeab4f8c24e99d10f8e7faeebf76c078efc7c6caea54ba06a",
+    )  # TODO: find a way for that? to depends on the account id used? it will depend on region too? check it
 
 
 def forwarded_from_virtual_host_addressed_request(headers: Dict[str, str]) -> bool:
@@ -203,7 +249,7 @@ def capitalize_header_name_from_snake_case(header_name: str) -> str:
     return "-".join([part.capitalize() for part in header_name.split("-")])
 
 
-def validate_kms_key_id(kms_key: str, bucket: FakeBucket) -> None:
+def validate_kms_key_id(kms_key: str, bucket: FakeBucket | S3Bucket) -> None:
     """
     Validate that the KMS key used to encrypt the object is valid
     :param kms_key: the KMS key id or ARN
@@ -212,11 +258,16 @@ def validate_kms_key_id(kms_key: str, bucket: FakeBucket) -> None:
     :raise KMS.NotFoundException if the key is not in the same region or does not exist
     :return: the key ARN if found and enabled
     """
+    if hasattr(bucket, "region_name"):
+        bucket_region = bucket.region_name
+    else:
+        bucket_region = bucket.bucket_region
+
     try:
         parsed_arn = parse_arn(kms_key)
         key_region = parsed_arn["region"]
         # the KMS key should be in the same region as the bucket, we can raise an exception without calling KMS
-        if key_region != bucket.region_name:
+        if key_region != bucket_region:
             raise CommonServiceException(
                 code="KMS.NotFoundException", message=f"Invalid arn {key_region}"
             )
@@ -227,11 +278,11 @@ def validate_kms_key_id(kms_key: str, bucket: FakeBucket) -> None:
         # recreate the ARN manually with the bucket region and bucket owner
         # if the KMS key is cross-account, user should provide an ARN and not a KeyId
         kms_key = arns.kms_key_arn(
-            key_id=key_id, account_id=bucket.account_id, region_name=bucket.region_name
+            key_id=key_id, account_id=bucket.account_id, region_name=bucket_region
         )
 
     # the KMS key should be in the same region as the bucket, create the client in the bucket region
-    kms_client = aws_stack.connect_to_service("kms", region_name=bucket.region_name)
+    kms_client = aws_stack.connect_to_service("kms", region_name=bucket_region)
     try:
         key = kms_client.describe_key(KeyId=kms_key)
         if not key["KeyMetadata"]["Enabled"]:

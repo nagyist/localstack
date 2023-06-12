@@ -3082,9 +3082,7 @@ class TestS3:
             )
 
             with pytest.raises(ClientError) as e:
-                response = aws_client.s3.head_bucket(
-                    Bucket=f"does-not-exist-{short_uid()}-{short_uid()}"
-                )
+                aws_client.s3.head_bucket(Bucket=f"does-not-exist-{short_uid()}-{short_uid()}")
             snapshot.match("head_bucket_not_exist", e.value.response)
         finally:
             aws_client.s3.delete_bucket(Bucket=bucket_1)
@@ -7660,3 +7658,11 @@ def _make_url_invalid(url_prefix: str, object_key: str, url: str) -> str:
             query_params["X-Amz-Expires"][0],
             query_params["X-Amz-Signature"][0],
         )
+
+
+class TestS3BucketCRUD:
+    def test_create_bucket(self, s3_create_bucket):
+        pass
+
+    def test_delete_bucket_with_objects(self, s3_bucket, aws_client):
+        pass

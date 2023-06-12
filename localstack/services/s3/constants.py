@@ -54,3 +54,14 @@ ALLOWED_HEADER_OVERRIDES = {
 # are creating bucket policies that enforce aws:SecureTransport, which makes the CDK deployment fail.
 # TODO: potentially look into making configurable
 ENABLE_MOTO_BUCKET_POLICY_ENFORCEMENT = False
+
+
+METADATA_SETTABLE_HEADERS = {
+    "Content-Md5",
+    "Content-Language",
+    "Content-Type",
+    "Content-Encoding",
+    "Cache-Control",
+    "Content-Disposition",
+    "x-robots-tag",
+}
