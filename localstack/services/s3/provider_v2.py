@@ -231,8 +231,9 @@ class S3Provider(S3Api, ServiceLifecycleHook):
             validate_kms_key_id(sse_kms_key_id, s3_bucket)
 
         key = request["Key"]
+        headers = context.request.headers
 
-        metadata = get_metadata_from_headers(context.request.headers)
+        metadata = get_metadata_from_headers(headers)
 
         # TODO: get all default from bucket, maybe extract logic
 
@@ -245,6 +246,12 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         checksum_algorithm = request.get("ChecksumAlgorithm")
 
         # validate encryption values
+
+        # check if chunked request
+        if headers.get("x-amz-content-sha256", "").startswith("STREAMING-"):
+            decoded_content_length = int(headers.get("x-amz-decoded-content-length", 0))
+        else:
+            decoded_content_length = None
 
         s3_key = S3Object(
             key=key,
@@ -260,13 +267,14 @@ class S3Provider(S3Api, ServiceLifecycleHook):
             lock_mode=request.get("ObjectLockMode"),
             lock_legal_status=request.get("ObjectLockLegalHoldStatus"),
             lock_until=request.get("ObjectLockRetainUntilDate"),
-            acl=None,
+            website_redirect_location=request.get("WebsiteRedirectLocation"),
+            decoded_content_length=decoded_content_length,
             expiration=None,  # TODO, from lifecycle, or should it be updated with config?
+            acl=None,
         )
 
-        existing_s3_object = s3_bucket.objects.get(key)
         # TODO: set is_last for list objects
-        if existing_s3_object:
+        if existing_s3_object := s3_bucket.objects.get(key):
             existing_s3_object.is_current = False
 
         # TODO: update versioning to include None, Enabled, Suspended
@@ -277,6 +285,9 @@ class S3Provider(S3Api, ServiceLifecycleHook):
             # the bucket never had versioning enabled, set the key
             # or the bucket has versioning disabled, just override the last version
             s3_bucket.objects.set_last_version(key=key, value=s3_key)
+
+        # TODO: tags: do we have tagging service or do we manually handle? see utils TaggingService
+        #  add to store
 
         # TODO: fields
         # Expiration: Optional[Expiration] TODO
@@ -462,6 +473,53 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         # checksum_algorithm: ChecksumAlgorithm = None,
     ) -> DeleteObjectsOutput:
         pass
+
+    # def copy_object(
+    #     self,
+    #     context: RequestContext,
+    #     bucket: BucketName,
+    #     copy_source: CopySource,
+    #     key: ObjectKey,
+    #     acl: ObjectCannedACL = None,
+    #     cache_control: CacheControl = None,
+    #     checksum_algorithm: ChecksumAlgorithm = None,
+    #     content_disposition: ContentDisposition = None,
+    #     content_encoding: ContentEncoding = None,
+    #     content_language: ContentLanguage = None,
+    #     content_type: ContentType = None,
+    #     copy_source_if_match: CopySourceIfMatch = None,
+    #     copy_source_if_modified_since: CopySourceIfModifiedSince = None,
+    #     copy_source_if_none_match: CopySourceIfNoneMatch = None,
+    #     copy_source_if_unmodified_since: CopySourceIfUnmodifiedSince = None,
+    #     expires: Expires = None,
+    #     grant_full_control: GrantFullControl = None,
+    #     grant_read: GrantRead = None,
+    #     grant_read_acp: GrantReadACP = None,
+    #     grant_write_acp: GrantWriteACP = None,
+    #     metadata: Metadata = None,
+    #     metadata_directive: MetadataDirective = None,
+    #     tagging_directive: TaggingDirective = None,
+    #     server_side_encryption: ServerSideEncryption = None,
+    #     storage_class: StorageClass = None,
+    #     website_redirect_location: WebsiteRedirectLocation = None,
+    #     sse_customer_algorithm: SSECustomerAlgorithm = None,
+    #     sse_customer_key: SSECustomerKey = None,
+    #     sse_customer_key_md5: SSECustomerKeyMD5 = None,
+    #     ssekms_key_id: SSEKMSKeyId = None,
+    #     ssekms_encryption_context: SSEKMSEncryptionContext = None,
+    #     bucket_key_enabled: BucketKeyEnabled = None,
+    #     copy_source_sse_customer_algorithm: CopySourceSSECustomerAlgorithm = None,
+    #     copy_source_sse_customer_key: CopySourceSSECustomerKey = None,
+    #     copy_source_sse_customer_key_md5: CopySourceSSECustomerKeyMD5 = None,
+    #     request_payer: RequestPayer = None,
+    #     tagging: TaggingHeader = None,
+    #     object_lock_mode: ObjectLockMode = None,
+    #     object_lock_retain_until_date: ObjectLockRetainUntilDate = None,
+    #     object_lock_legal_hold_status: ObjectLockLegalHoldStatus = None,
+    #     expected_bucket_owner: AccountId = None,
+    #     expected_source_bucket_owner: AccountId = None,
+    # ) -> CopyObjectOutput:
+    #     pass
 
     # def list_objects(
     #     self,

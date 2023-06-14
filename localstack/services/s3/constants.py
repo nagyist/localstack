@@ -66,3 +66,5 @@ METADATA_SETTABLE_HEADERS = {
     "Content-Disposition",
     "x-robots-tag",
 }
+
+STREAM_CHUNK_SIZE = 2048 * 2

@@ -45,6 +45,7 @@ from localstack.aws.api.s3 import (  # BucketCannedACL,
     SSEKMSKeyId,
     StorageClass,
     WebsiteConfiguration,
+    WebsiteRedirectLocation,
 )
 from localstack.services.s3.constants import S3_CHUNK_SIZE
 from localstack.services.s3.exceptions import InvalidRequest
@@ -165,6 +166,7 @@ class S3Object:
     lock_mode: Optional[ObjectLockMode]
     lock_legal_status: Optional[ObjectLockLegalHoldStatus]
     lock_until: Optional[datetime]
+    website_redirect_location: Optional[WebsiteRedirectLocation]
     acl: Optional[str]  # TODO: we need to change something here, how it's done?
     is_current: bool
 
@@ -172,7 +174,7 @@ class S3Object:
         self,
         key: ObjectKey,
         value: Optional[IO[bytes]],
-        metadata: Metadata,
+        metadata: Optional[Metadata] = None,
         storage_class: StorageClass = StorageClass.STANDARD,
         expires: Optional[datetime] = None,
         expiration: Optional[datetime] = None,  # come from lifecycle
@@ -184,6 +186,7 @@ class S3Object:
         lock_mode: Optional[ObjectLockMode] = None,  # inherit bucket
         lock_legal_status: Optional[ObjectLockLegalHoldStatus] = None,  # inherit bucket
         lock_until: Optional[datetime] = None,
+        website_redirect_location: Optional[WebsiteRedirectLocation] = None,
         acl: Optional[str] = None,  # TODO
         expiry: Optional[datetime] = None,  # TODO
         etag: Optional[ETag] = None,  # TODO: this for multipart op
@@ -206,6 +209,7 @@ class S3Object:
         self.acl = acl
         self.expiry = expiry
         self.expiration = expiration
+        self.website_redirect_location = website_redirect_location
         self.is_current = True
         self.value = create_key_storage()
 
@@ -387,6 +391,11 @@ class _VersionedKeyStore(dict):  # type: ignore
         super().__setitem__(key, current)
 
     def get(self, key: str, default: S3Object | S3DeleteMarker = None) -> S3Object | S3DeleteMarker:
+        """
+        :param key: the ObjectKey
+        :param default: default return value if the key is not present
+        :return: the current (last version) S3Object or DeleteMarker
+        """
         try:
             return self[key]
         except (KeyError, IndexError):

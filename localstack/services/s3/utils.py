@@ -2,7 +2,9 @@ import datetime
 import hashlib
 import re
 import zlib
+from dataclasses import dataclass
 from typing import Dict, Literal, Optional, Tuple, Type, Union
+from urllib.parse import parse_qs, unquote, urlparse
 
 import moto.s3.models as moto_s3_models
 from botocore.exceptions import ClientError
@@ -17,11 +19,13 @@ from localstack.aws.api.s3 import (
     BucketName,
     ChecksumAlgorithm,
     InvalidArgument,
+    InvalidRange,
     Metadata,
     MethodNotAllowed,
     NoSuchBucket,
     NoSuchKey,
     ObjectKey,
+    ObjectVersionId,
     Owner,
 )
 from localstack.services.s3.constants import (
@@ -58,6 +62,92 @@ S3_VIRTUAL_HOSTNAME_REGEX = (  # path based refs have at least valid bucket expr
 PATTERN_UUID = re.compile(
     r"[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}"
 )
+
+
+def extract_bucket_key_version_id_from_copy_source(
+    copy_source: str,
+) -> tuple[BucketName, ObjectKey, Optional[ObjectVersionId]]:
+    copy_source_parsed = urlparse(copy_source)
+    src_bucket, src_key = unquote(copy_source_parsed.path).lstrip("/").split("/", 1)
+    src_version_id = parse_qs(copy_source_parsed.query).get("versionId", [None])[0]
+    return src_bucket, src_key, src_version_id
+
+
+def get_s3_checksum(algorithm):
+    match algorithm:
+        case ChecksumAlgorithm.CRC32:
+            return S3CRC32Checksum()
+
+        case ChecksumAlgorithm.CRC32C:
+            from botocore.httpchecksum import CrtCrc32cChecksum
+
+            return CrtCrc32cChecksum()
+
+        case ChecksumAlgorithm.SHA1:
+            return hashlib.sha1(usedforsecurity=False)
+
+        case ChecksumAlgorithm.SHA256:
+            return hashlib.sha256(usedforsecurity=False)
+
+        case _:
+            # TODO: check proper error? for now validated client side, need to check server response
+            raise InvalidRequest("The value specified in the x-amz-trailer header is not supported")
+
+
+class S3CRC32Checksum:
+    __slots__ = ["checksum"]
+
+    def __init__(self):
+        self.checksum = None
+
+    def update(self, value: bytes):
+        if self.checksum is None:
+            self.checksum = zlib.crc32(value)
+            return
+
+        self.checksum = zlib.crc32(value, self.checksum)
+
+    def digest(self) -> bytes:
+        return self.checksum.to_bytes(4, "big")
+
+
+@dataclass
+class ParsedRange:
+    content_range: str
+    content_length: int
+    begin: int
+    end: int
+
+
+def parse_range_header(range_header: str, object_size: int) -> ParsedRange:
+    last = object_size - 1
+    _, rspec = range_header.split("=")
+    # TODO: check with AWS
+    if "," in rspec:
+        raise NotImplementedError("Multiple range specifiers not supported")
+
+    begin, end = [int(i) if i else None for i in rspec.split("-")]
+    if begin is not None:  # byte range
+        end = last if end is None else min(end, last)
+    elif end is not None:  # suffix byte range
+        begin = object_size - min(end, object_size)
+        end = last
+    else:
+        # TODO, find exception here
+        raise Exception("TODO")
+    if begin < 0 or end > last or begin > min(end, last):
+        raise InvalidRange(
+            "",
+            ActualObjectSize=str(object_size),
+            RangeRequest=range_header,
+        )
+
+    return ParsedRange(
+        content_range=f"bytes {begin}-{end}/{object_size}",
+        content_length=end - begin + 1,
+        begin=begin,
+        end=end,
+    )
 
 
 def get_full_default_bucket_location(bucket_name):
@@ -103,44 +193,6 @@ def verify_checksum(checksum_algorithm: str, data: bytes, request: Dict):
         raise InvalidRequest(
             f"Value for x-amz-checksum-{checksum_algorithm.lower()} header is invalid."
         )
-
-
-def get_s3_checksum(algorithm):
-    match algorithm:
-        case ChecksumAlgorithm.CRC32:
-            return S3CRC32Checksum()
-
-        case ChecksumAlgorithm.CRC32C:
-            from botocore.httpchecksum import CrtCrc32cChecksum
-
-            return CrtCrc32cChecksum()
-
-        case ChecksumAlgorithm.SHA1:
-            return hashlib.sha1(usedforsecurity=False)
-
-        case ChecksumAlgorithm.SHA256:
-            return hashlib.sha256(usedforsecurity=False)
-
-        case _:
-            # TODO: check proper error? for now validated client side, need to check server response
-            raise InvalidRequest("The value specified in the x-amz-trailer header is not supported")
-
-
-class S3CRC32Checksum:
-    __slots__ = ["checksum"]
-
-    def __init__(self):
-        self.checksum = None
-
-    def update(self, value: bytes):
-        if self.checksum is None:
-            self.checksum = zlib.crc32(value)
-            return
-
-        self.checksum = zlib.crc32(value, self.checksum)
-
-    def digest(self) -> bytes:
-        return self.checksum.to_bytes(4, "big")
 
 
 def is_key_expired(key_object: Union[FakeKey, FakeDeleteMarker]) -> bool:
