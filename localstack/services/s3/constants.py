@@ -58,12 +58,12 @@ ENABLE_MOTO_BUCKET_POLICY_ENFORCEMENT = False
 
 
 METADATA_SETTABLE_HEADERS = {
-    "Content-Md5",
-    "Content-Language",
-    "Content-Type",
-    "Content-Encoding",
-    "Cache-Control",
-    "Content-Disposition",
+    "content-md5",
+    "content-language",
+    "content-type",
+    "content-encoding",
+    "cache-control",
+    "content-disposition",
     "x-robots-tag",
 }
 

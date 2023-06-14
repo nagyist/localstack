@@ -16,6 +16,7 @@ from localstack.aws.api.s3 import (  # BucketCannedACL,
     AccountId,
     AnalyticsConfiguration,
     AnalyticsId,
+    Body,
     BucketAccelerateStatus,
     BucketName,
     BucketRegion,
@@ -49,7 +50,7 @@ from localstack.aws.api.s3 import (  # BucketCannedACL,
 )
 from localstack.services.s3.constants import S3_CHUNK_SIZE
 from localstack.services.s3.exceptions import InvalidRequest
-from localstack.services.s3.utils import get_owner_for_account_id, get_s3_checksum
+from localstack.services.s3.utils import ParsedRange, get_owner_for_account_id, get_s3_checksum
 from localstack.services.stores import (
     AccountRegionBundle,
     BaseStore,
@@ -74,6 +75,7 @@ def create_key_storage():
     return KEY_STORAGE_CLASS(max_size=16)
 
 
+# TODO move to utils?
 def iso_8601_datetime_without_milliseconds_s3(
     value: datetime,
 ) -> Optional[str]:
@@ -169,6 +171,7 @@ class S3Object:
     website_redirect_location: Optional[WebsiteRedirectLocation]
     acl: Optional[str]  # TODO: we need to change something here, how it's done?
     is_current: bool
+    parts: Optional[list[tuple[str, str]]]
 
     def __init__(
         self,
@@ -191,10 +194,12 @@ class S3Object:
         expiry: Optional[datetime] = None,  # TODO
         etag: Optional[ETag] = None,  # TODO: this for multipart op
         decoded_content_length: Optional[int] = None,  # TODO: this is for `aws-chunk` requests
+        parts: Optional[list[tuple[str, str]]] = None,
     ):
         self.lock = threading.RLock()
         self.key = key
         self.metadata = metadata
+        self.version_id = None
         self.storage_class = storage_class
         self.expires = expires
         self.checksum_algorithm = checksum_algorithm
@@ -212,6 +217,9 @@ class S3Object:
         self.website_redirect_location = website_redirect_location
         self.is_current = True
         self.value = create_key_storage()
+        self.last_modified = datetime.now()
+        self.size = 0
+        self.parts = parts
 
         if isinstance(value, KEY_STORAGE_CLASS):
             self._set_value_from_multipart(value, etag)
@@ -254,7 +262,7 @@ class S3Object:
 
             self.etag = etag.hexdigest()
 
-            self.contentsize = self.value.tell()
+            self.size = self.value.tell()
             self.value.seek(0)
 
     def _set_value_from_chunked_stream(self, value: IO[bytes], decoded_length: int):
@@ -329,17 +337,21 @@ class S3Object:
                 )
 
             self.etag = etag.hexdigest()
-            self.contentsize = self.value.tell()
+            self.size = self.value.tell()
             self.value.seek(0)
 
     def get_metadata_headers(self):
         headers = Headers()
-        headers["Last-Modified"] = self.last_modified_rfc1123
+        headers["LastModified"] = self.last_modified_rfc1123
+        headers["ContentLength"] = str(self.size)
+        headers["ETag"] = f'"{self.etag}"'
         if self.expires:
             headers["Expires"] = self.expires_rfc1123
 
         for metadata_key, metadata_value in self.metadata.items():
             headers[metadata_key] = metadata_value
+
+        return headers
 
     @property
     def last_modified_iso8601(self) -> str:
@@ -354,6 +366,42 @@ class S3Object:
     @property
     def expires_rfc1123(self) -> str:
         return rfc_1123_datetime(self.expires)
+
+    def get_body_iterator(self) -> Iterator[Body]:
+        def get_stream_iterator() -> bytes:
+            pos = 0
+            while True:
+                self.value.seek(pos)  # TODO: is seek an heavy op?
+                data = self.value.read(S3_CHUNK_SIZE)
+                if not data:
+                    return b""
+
+                read = len(data)
+                pos += read
+
+                yield data
+
+        return get_stream_iterator()
+
+    def get_range_body_iterator(self, range_data: ParsedRange) -> Iterator[Body]:
+        def get_range_stream_iterator() -> bytes:
+            pos = range_data.begin
+            max_length = range_data.content_length
+            while True:
+                self.value.seek(pos)  # TODO: is seek an heavy op?
+                # don't read more than the max content-length
+                amount = min(max_length, S3_CHUNK_SIZE)
+                data = self.value.read(amount)
+                if not data:
+                    return b""
+
+                read = len(data)
+                pos += read
+                max_length -= read
+
+                yield data
+
+        return get_range_stream_iterator()
 
 
 class S3DeleteMarker:

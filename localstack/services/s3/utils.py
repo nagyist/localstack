@@ -3,7 +3,7 @@ import hashlib
 import re
 import zlib
 from dataclasses import dataclass
-from typing import Dict, Literal, Optional, Tuple, Type, Union
+from typing import Any, Dict, Literal, Optional, Tuple, Type, Union
 from urllib.parse import parse_qs, unquote, urlparse
 
 import moto.s3.models as moto_s3_models
@@ -34,7 +34,6 @@ from localstack.services.s3.constants import (
     VALID_CANNED_ACLS_BUCKET,
 )
 from localstack.services.s3.exceptions import InvalidRequest
-from localstack.services.s3.models_v2 import S3Bucket
 from localstack.utils.aws import arns, aws_stack
 from localstack.utils.aws.arns import parse_arn
 from localstack.utils.strings import checksum_crc32, checksum_crc32c, hash_sha1, hash_sha256
@@ -62,6 +61,13 @@ S3_VIRTUAL_HOSTNAME_REGEX = (  # path based refs have at least valid bucket expr
 PATTERN_UUID = re.compile(
     r"[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}"
 )
+
+
+def get_owner_for_account_id(account_id: str):
+    return Owner(
+        DisplayName="webfile",  # only in certain regions, see above
+        ID="75aa57f09aa0c8caeab4f8c24e99d10f8e7faeebf76c078efc7c6caea54ba06a",
+    )  # TODO: find a way for that? to depends on the account id used? it will depend on region too? check it
 
 
 def extract_bucket_key_version_id_from_copy_source(
@@ -232,7 +238,8 @@ def get_class_attrs_from_spec_class(spec_class: Type[str]):
 
 
 def get_metadata_from_headers(headers: Headers) -> Metadata:
-    metadata = Metadata()
+    metadata: Metadata = {}
+    # TODO: maybe separate between system metadata and user metadata
     meta_regex = re.compile(r"^x-amz-meta-([a-zA-Z0-9\-_.]+)$", flags=re.IGNORECASE)
 
     for header in headers.keys():
@@ -242,22 +249,18 @@ def get_metadata_from_headers(headers: Headers) -> Metadata:
             if result:
                 # Check for extra metadata
                 meta_key = result.group(0).lower()
-            elif header.lower() in METADATA_SETTABLE_HEADERS:
+            elif (header_low := header.lower()) in METADATA_SETTABLE_HEADERS:
                 # Check for special metadata that doesn't start with x-amz-meta
-                meta_key = header
+                if header_low.startswith("cache") or header_low.startswith("content"):
+                    header_low = "".join(part.capitalize() for part in header_low.split("-"))
+
+                meta_key = header_low
             # TODO: test multiple values for headers
             if meta_key:
                 metadata[meta_key] = (
                     headers[header][0] if type(headers[header]) == list else headers[header]
                 )
     return metadata
-
-
-def get_owner_for_account_id(account_id: str):
-    return Owner(
-        DisplayName="webfile",  # only in certain regions, see above
-        ID="75aa57f09aa0c8caeab4f8c24e99d10f8e7faeebf76c078efc7c6caea54ba06a",
-    )  # TODO: find a way for that? to depends on the account id used? it will depend on region too? check it
 
 
 def forwarded_from_virtual_host_addressed_request(headers: Dict[str, str]) -> bool:
@@ -341,7 +344,8 @@ def capitalize_header_name_from_snake_case(header_name: str) -> str:
     return "-".join([part.capitalize() for part in header_name.split("-")])
 
 
-def validate_kms_key_id(kms_key: str, bucket: FakeBucket | S3Bucket) -> None:
+# TODO: replace Any by a replacement for S3Bucket, some kind of defined type?
+def validate_kms_key_id(kms_key: str, bucket: FakeBucket | Any) -> None:
     """
     Validate that the KMS key used to encrypt the object is valid
     :param kms_key: the KMS key id or ARN

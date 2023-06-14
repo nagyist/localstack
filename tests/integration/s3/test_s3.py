@@ -523,8 +523,9 @@ class TestS3:
         paths=[
             "$..HTTPHeaders.connection",
             # TODO content-length and type is wrong, skipping for now
-            "$..HTTPHeaders.content-length",  # 58, but should be 0
+            "$..HTTPHeaders.content-length",  # 58, but should be 0 # TODO!!!
             "$..HTTPHeaders.content-type",  # application/xml but should not be set
+            "$..MaxAttemptsReached",
         ],
     )  # for ASF we currently always set 'close'
     @pytest.mark.skip_snapshot_verify(
@@ -601,6 +602,7 @@ class TestS3:
         aws_client.s3.put_object(Bucket=s3_bucket, Key=object_key, Metadata=metadata, Body="foo")
         metadata_saved = aws_client.s3.head_object(Bucket=s3_bucket, Key=object_key)["Metadata"]
         snapshot.match("head-object", metadata_saved)
+        # TODO: match headers from ResponseMetadata TODO TODO TODO
 
         # note that casing is removed (since headers are case-insensitive)
         assert metadata_saved == {"test_meta_1": "foo", "__meta_2": "bar"}

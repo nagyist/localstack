@@ -16,6 +16,9 @@ from localstack.aws.api.s3 import (  # BucketName, CreateBucketConfiguration,; I
     DeleteObjectRequest,
     DeleteObjectsOutput,
     DeleteObjectsRequest,
+    GetObjectAttributesOutput,
+    GetObjectAttributesParts,
+    GetObjectAttributesRequest,
     GetObjectOutput,
     GetObjectRequest,
     HeadBucketOutput,
@@ -48,6 +51,7 @@ from localstack.services.s3.utils import (
     get_full_default_bucket_location,
     get_metadata_from_headers,
     get_owner_for_account_id,
+    parse_range_header,
     validate_kms_key_id,
 )
 
@@ -234,6 +238,9 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         headers = context.request.headers
 
         metadata = get_metadata_from_headers(headers)
+        # set default ContentType
+        if "ContentType" not in metadata:
+            metadata["ContentType"] = "binary/octet-stream"
 
         # TODO: get all default from bucket, maybe extract logic
 
@@ -260,7 +267,9 @@ class S3Provider(S3Api, ServiceLifecycleHook):
             expires=request.get("Expires"),
             metadata=metadata,
             checksum_algorithm=checksum_algorithm,
-            checksum_value=request.get(f"Checksum{checksum_algorithm.upper()}"),
+            checksum_value=request.get(f"Checksum{checksum_algorithm.upper()}")
+            if checksum_algorithm
+            else None,
             encryption=request.get("ServerSideEncryption"),
             kms_key_id=request.get("SSEKMSKeyId"),
             bucket_key_enabled=request.get("BucketKeyEnabled"),
@@ -278,9 +287,11 @@ class S3Provider(S3Api, ServiceLifecycleHook):
             existing_s3_object.is_current = False
 
         # TODO: update versioning to include None, Enabled, Suspended
+        # if None, version_id = None, Suspend = "null" Enabled = "random"
         if s3_bucket.versioning_status:
             # the bucket versioning is enabled, add the key to the list
             s3_bucket.objects[key] = s3_key
+            s3_key.version_id = "something"
         else:
             # the bucket never had versioning enabled, set the key
             # or the bucket has versioning disabled, just override the last version
@@ -305,7 +316,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         # BucketKeyEnabled: Optional[BucketKeyEnabled] OK
         # RequestCharged: Optional[RequestCharged]  # TODO
         response = PutObjectOutput(
-            ETag=s3_key.etag,
+            ETag=f'"{s3_key.etag}"',
         )
         if s3_key.version_id:  # TODO: better way?
             response["VersionId"] = s3_key.version_id
@@ -399,6 +410,8 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         if not (s3_bucket := store.buckets.get(bucket_name)):
             raise NoSuchBucket("The specified bucket does not exist", BucketName=bucket_name)
 
+        # TODO implement PartNumber once multipart is done
+
         if version_id := request.get("VersionId"):
             if s3_bucket.versioning_status:
                 s3_object = s3_bucket.objects.get_version(key=object_key, version_id=version_id)
@@ -415,9 +428,27 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         if isinstance(s3_object, S3DeleteMarker):
             pass
 
+        # TODO implement special logic in serializer for S3, no specs for `x-amz-meta` headers, pass them as is
+        # or maybe it's Metadata field? check and implement sysem/user metadata separation
         response = GetObjectOutput(
-            ETag=s3_object.etag,
+            AcceptRanges="bytes",
+            **s3_object.get_metadata_headers(),
         )
+
+        if checksum_algorithm := s3_object.checksum_algorithm:
+            # this is a bug in AWS: it sets the content encoding header to an empty string (parity tested)
+            response["ContentEncoding"] = ""
+            if request.get("ChecksumMode") == "ENABLED":
+                response[f"Checksum{checksum_algorithm.upper()}"] = checksum  # noqa
+
+        if range_header := request.get("Range"):
+            range_data = parse_range_header(range_header, s3_object.size)
+            response["Body"] = s3_object.get_range_body_iterator(range_data)
+            # TODO: should we set content-length? feels like it would allow chunk encoding but?? well parity says we should
+            response["ContentRange"] = range_data.content_range
+            response["ContentLength"] = range_data.content_length
+        else:
+            response["Body"] = s3_object.get_body_iterator()
 
         return response
 
@@ -432,7 +463,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         # if_modified_since: IfModifiedSince = None,
         # if_none_match: IfNoneMatch = None,
         # if_unmodified_since: IfUnmodifiedSince = None,
-        # range: Range = None,
+        # range: Range = None,  # DONE
         # version_id: ObjectVersionId = None,
         # sse_customer_algorithm: SSECustomerAlgorithm = None,
         # sse_customer_key: SSECustomerKey = None,
@@ -440,9 +471,82 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         # request_payer: RequestPayer = None,
         # part_number: PartNumber = None,
         # expected_bucket_owner: AccountId = None,
-        # checksum_mode: ChecksumMode = None,
+        # checksum_mode: ChecksumMode = None,  # DONE
     ) -> HeadObjectOutput:
-        pass
+        store = self.get_store(context.account_id, context.region)
+        bucket_name = request["Bucket"]
+        object_key = request["Key"]
+        if not (s3_bucket := store.buckets.get(bucket_name)):
+            raise NoSuchBucket("The specified bucket does not exist", BucketName=bucket_name)
+
+        # TODO implement PartNumber, don't know about part number + version id?
+        if version_id := request.get("VersionId"):
+            if s3_bucket.versioning_status:
+                s3_object = s3_bucket.objects.get_version(key=object_key, version_id=version_id)
+            else:
+                # TODO
+                # can you provide a version id to a bucket with never activated versioning?
+                s3_object = s3_bucket.objects.get(key=object_key)
+                pass
+        else:
+            s3_object = s3_bucket.objects.get(key=object_key)
+
+        if not s3_object:
+            pass
+        if isinstance(s3_object, S3DeleteMarker):
+            pass
+
+        # DeleteMarker: Optional[DeleteMarker]
+        # AcceptRanges: Optional[AcceptRanges]
+        # Expiration: Optional[Expiration]
+        # Restore: Optional[Restore]
+        # ArchiveStatus: Optional[ArchiveStatus]
+        # LastModified: Optional[LastModified]
+        # ContentLength: Optional[ContentLength]
+        # ChecksumCRC32: Optional[ChecksumCRC32]
+        # ChecksumCRC32C: Optional[ChecksumCRC32C]
+        # ChecksumSHA1: Optional[ChecksumSHA1]
+        # ChecksumSHA256: Optional[ChecksumSHA256]
+        # ETag: Optional[ETag]
+        # MissingMeta: Optional[MissingMeta]
+        # VersionId: Optional[ObjectVersionId]
+        # CacheControl: Optional[CacheControl]
+        # ContentDisposition: Optional[ContentDisposition]
+        # ContentEncoding: Optional[ContentEncoding]
+        # ContentLanguage: Optional[ContentLanguage]
+        # ContentType: Optional[ContentType]
+        # Expires: Optional[Expires]
+        # WebsiteRedirectLocation: Optional[WebsiteRedirectLocation]
+        # ServerSideEncryption: Optional[ServerSideEncryption]
+        # Metadata: Optional[Metadata]
+        # SSECustomerAlgorithm: Optional[SSECustomerAlgorithm]
+        # SSECustomerKeyMD5: Optional[SSECustomerKeyMD5]
+        # SSEKMSKeyId: Optional[SSEKMSKeyId]
+        # BucketKeyEnabled: Optional[BucketKeyEnabled]
+        # StorageClass: Optional[StorageClass]
+        # RequestCharged: Optional[RequestCharged]
+        # ReplicationStatus: Optional[ReplicationStatus]
+        # PartsCount: Optional[PartsCount]
+        # ObjectLockMode: Optional[ObjectLockMode]
+        # ObjectLockRetainUntilDate: Optional[ObjectLockRetainUntilDate]
+        # ObjectLockLegalHoldStatus: Optional[ObjectLockLegalHoldStatus]
+
+        response = HeadObjectOutput(
+            AcceptRanges="bytes",
+            **s3_object.get_metadata_headers(),
+        )
+        # TODO implements if_match if_modified_since if_none_match if_unmodified_since
+        if checksum_algorithm := s3_object.checksum_algorithm:
+            # this is a bug in AWS: it sets the content encoding header to an empty string (parity tested)
+            response["ContentEncoding"] = ""
+            if request.get("ChecksumMode") == "ENABLED":
+                response[f"Checksum{checksum_algorithm.upper()}"] = checksum  # noqa
+
+        if range_header := request.get("Range"):
+            range_data = parse_range_header(range_header, s3_object.size)
+            response["ContentLength"] = range_data.content_length
+
+        return response
 
     @handler("DeleteObject", expand=False)
     def delete_object(
@@ -550,6 +654,62 @@ class S3Provider(S3Api, ServiceLifecycleHook):
     #     expected_bucket_owner: AccountId = None,
     # ) -> ListObjectsV2Output:
     #     pass
+
+    @handler("GetObjectAttributes", expand=False)
+    def get_object_attributes(
+        self,
+        context: RequestContext,
+        request: GetObjectAttributesRequest,
+    ) -> GetObjectAttributesOutput:
+        store = self.get_store(context.account_id, context.region)
+        bucket_name = request["Bucket"]
+        object_key = request["Key"]
+        if not (s3_bucket := store.buckets.get(bucket_name)):
+            raise NoSuchBucket("The specified bucket does not exist", BucketName=bucket_name)
+
+        # TODO implement PartNumber once multipart is done
+
+        if version_id := request.get("VersionId"):
+            if s3_bucket.versioning_status:
+                s3_object = s3_bucket.objects.get_version(key=object_key, version_id=version_id)
+            else:
+                # TODO
+                # can you provide a version id to a bucket with never activated versioning?
+                s3_object = s3_bucket.objects.get(key=object_key)
+                pass
+        else:
+            s3_object = s3_bucket.objects.get(key=object_key)
+
+        if not s3_object:
+            pass
+        if isinstance(s3_object, S3DeleteMarker):
+            pass
+
+        object_attrs = request.get("ObjectAttributes", [])
+        response = GetObjectAttributesOutput()
+        # TODO: see Checksum field
+        if "ETag" in object_attrs:
+            response["ETag"] = s3_object.etag
+        if "StorageClass" in object_attrs:
+            response["StorageClass"] = s3_object.storage_class
+        if "ObjectSize" in object_attrs:
+            response["ObjectSize"] = s3_object.size
+        if "Checksum" in object_attrs and (checksum_algorithm := s3_object.checksum_algorithm):
+            response["Checksum"] = {
+                f"Checksum{checksum_algorithm.upper()}": s3_object.checksum_value
+            }  # noqa
+
+        response["LastModified"] = s3_object.last_modified
+
+        # TODO enable more from this
+        if s3_bucket.versioning_status:
+            response["VersionId"] = s3_object.version_id
+
+        if s3_object.parts is not None:
+            response["ObjectParts"] = GetObjectAttributesParts(TotalPartsCount=len(s3_object.parts))
+
+        return response
+
     #
     #
     # def get_bucket_location(
