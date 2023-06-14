@@ -3,7 +3,7 @@ import hashlib
 import re
 import zlib
 from typing import Dict, Literal, Optional, Tuple, Union
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib import parse as urlparser
 
 import moto.s3.models as moto_s3_models
 from botocore.exceptions import ClientError
@@ -62,9 +62,9 @@ class InvalidRequest(ServiceException):
 def extract_bucket_key_version_id_from_copy_source(
     copy_source: str,
 ) -> tuple[BucketName, ObjectKey, Optional[str]]:
-    copy_source_parsed = urlparse(copy_source)
-    src_bucket, src_key = unquote(copy_source_parsed.path).lstrip("/").split("/", 1)
-    src_version_id = parse_qs(copy_source_parsed.query).get("versionId", [None])[0]
+    copy_source_parsed = urlparser.urlparse(copy_source)
+    src_bucket, src_key = urlparser.unquote(copy_source_parsed.path).lstrip("/").split("/", 1)
+    src_version_id = urlparser.parse_qs(copy_source_parsed.query).get("versionId", [None])[0]
     return src_bucket, src_key, src_version_id
 
 
