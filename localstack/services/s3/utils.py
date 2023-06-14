@@ -1,5 +1,7 @@
 import datetime
+import hashlib
 import re
+import zlib
 from typing import Dict, Literal, Optional, Tuple, Type, Union
 
 import moto.s3.models as moto_s3_models
@@ -101,6 +103,44 @@ def verify_checksum(checksum_algorithm: str, data: bytes, request: Dict):
         raise InvalidRequest(
             f"Value for x-amz-checksum-{checksum_algorithm.lower()} header is invalid."
         )
+
+
+def get_s3_checksum(algorithm):
+    match algorithm:
+        case ChecksumAlgorithm.CRC32:
+            return S3CRC32Checksum()
+
+        case ChecksumAlgorithm.CRC32C:
+            from botocore.httpchecksum import CrtCrc32cChecksum
+
+            return CrtCrc32cChecksum()
+
+        case ChecksumAlgorithm.SHA1:
+            return hashlib.sha1(usedforsecurity=False)
+
+        case ChecksumAlgorithm.SHA256:
+            return hashlib.sha256(usedforsecurity=False)
+
+        case _:
+            # TODO: check proper error? for now validated client side, need to check server response
+            raise InvalidRequest("The value specified in the x-amz-trailer header is not supported")
+
+
+class S3CRC32Checksum:
+    __slots__ = ["checksum"]
+
+    def __init__(self):
+        self.checksum = None
+
+    def update(self, value: bytes):
+        if self.checksum is None:
+            self.checksum = zlib.crc32(value)
+            return
+
+        self.checksum = zlib.crc32(value, self.checksum)
+
+    def digest(self) -> bytes:
+        return self.checksum.to_bytes(4, "big")
 
 
 def is_key_expired(key_object: Union[FakeKey, FakeDeleteMarker]) -> bool:

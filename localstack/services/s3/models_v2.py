@@ -1,9 +1,15 @@
 # TODO, for now, this file will contain only files for the new S3 provider but not compatible with persistence
 # it will then put in the other models file?
 # do something specific in the persistence file?
+import base64
+import hashlib
+import logging
+import threading
 from datetime import datetime
 from tempfile import SpooledTemporaryFile
 from typing import IO, Iterator, Optional
+
+from werkzeug.datastructures.headers import Headers
 
 from localstack import config
 from localstack.aws.api.s3 import (  # BucketCannedACL,
@@ -40,7 +46,9 @@ from localstack.aws.api.s3 import (  # BucketCannedACL,
     StorageClass,
     WebsiteConfiguration,
 )
-from localstack.services.s3.utils import get_owner_for_account_id
+from localstack.services.s3.constants import S3_CHUNK_SIZE
+from localstack.services.s3.exceptions import InvalidRequest
+from localstack.services.s3.utils import get_owner_for_account_id, get_s3_checksum
 from localstack.services.stores import (
     AccountRegionBundle,
     BaseStore,
@@ -54,6 +62,7 @@ from localstack.services.stores import (
 # for persistence, append the version id to the key name using a special symbol?? like __version_id__={version_id}
 
 # TODO: we need to make the SpooledTemporaryFile configurable for persistence?
+LOG = logging.getLogger(__name__)
 
 KEY_STORAGE_CLASS = SpooledTemporaryFile
 
@@ -62,6 +71,23 @@ def create_key_storage():
     # we can pass extra arguments here and all?
     # let's see how to make it configurable
     return KEY_STORAGE_CLASS(max_size=16)
+
+
+def iso_8601_datetime_without_milliseconds_s3(
+    value: datetime,
+) -> Optional[str]:
+    return value.strftime("%Y-%m-%dT%H:%M:%S.000Z") if value else None
+
+
+RFC1123 = "%a, %d %b %Y %H:%M:%S GMT"
+
+
+def rfc_1123_datetime(src: datetime) -> str:
+    return src.strftime(RFC1123)
+
+
+def str_to_rfc_1123_datetime(value: str) -> datetime:
+    return datetime.strptime(value, RFC1123)
 
 
 # TODO: we will need a versioned key store as well, let's check what we can get better
@@ -128,6 +154,8 @@ class S3Object:
     metadata: Metadata  # TODO: check this?
     last_modified: datetime
     expiry: Optional[datetime]
+    expires: Optional[datetime]
+    expiration: Optional[datetime]
     storage_class: StorageClass
     encryption: Optional[ServerSideEncryption]
     kms_key_id: Optional[SSEKMSKeyId]
@@ -146,6 +174,8 @@ class S3Object:
         value: Optional[IO[bytes]],
         metadata: Metadata,
         storage_class: StorageClass = StorageClass.STANDARD,
+        expires: Optional[datetime] = None,
+        expiration: Optional[datetime] = None,  # come from lifecycle
         checksum_algorithm: Optional[ChecksumAlgorithm] = None,
         checksum_value: Optional[str] = None,
         encryption: Optional[ServerSideEncryption] = None,  # inherit bucket
@@ -155,10 +185,15 @@ class S3Object:
         lock_legal_status: Optional[ObjectLockLegalHoldStatus] = None,  # inherit bucket
         lock_until: Optional[datetime] = None,
         acl: Optional[str] = None,  # TODO
+        expiry: Optional[datetime] = None,  # TODO
+        etag: Optional[ETag] = None,  # TODO: this for multipart op
+        decoded_content_length: Optional[int] = None,  # TODO: this is for `aws-chunk` requests
     ):
+        self.lock = threading.RLock()
         self.key = key
         self.metadata = metadata
         self.storage_class = storage_class
+        self.expires = expires
         self.checksum_algorithm = checksum_algorithm
         self.checksum_value = checksum_value
         self.encryption = encryption
@@ -169,14 +204,152 @@ class S3Object:
         self.lock_legal_status = lock_legal_status
         self.lock_until = lock_until
         self.acl = acl
+        self.expiry = expiry
+        self.expiration = expiration
         self.is_current = True
-
         self.value = create_key_storage()
 
-        self._set_value(value)
+        if isinstance(value, KEY_STORAGE_CLASS):
+            self._set_value_from_multipart(value, etag)
+        elif decoded_content_length is not None:
+            self._set_value_from_chunked_stream(value, decoded_content_length)
+        else:
+            self._set_value_from_stream(value)
 
-    def _set_value(self, value: IO[bytes]):
-        pass
+    def _set_value_from_multipart(self, value: KEY_STORAGE_CLASS, etag: ETag):
+        self.value = value
+        self.etag = etag
+
+    def _set_value_from_stream(self, value: IO[bytes]):
+        with self.lock:
+            self.value.seek(0)
+            self.value.truncate()
+            # We have 2 cases:
+            # The client gave a checksum value, we will need to compute the value and validate it against
+            # or the client have an algorithm value only and we need to compute the checksum
+            checksum = None
+            calculated_checksum = None
+            if self.checksum_algorithm:
+                checksum = get_s3_checksum(self.checksum_algorithm)
+
+            etag = hashlib.md5(usedforsecurity=False)
+
+            while data := value.read(S3_CHUNK_SIZE):
+                self.value.write(data)
+                etag.update(data)
+                if self.checksum_algorithm:
+                    checksum.update(data)
+
+            if self.checksum_algorithm:
+                calculated_checksum = base64.b64encode(checksum.digest()).decode()
+
+            if self.checksum_value and self.checksum_value != calculated_checksum:
+                raise InvalidRequest(
+                    f"Value for x-amz-checksum-{self.checksum_algorithm.lower()} header is invalid."
+                )
+
+            self.etag = etag.hexdigest()
+
+            self.contentsize = self.value.tell()
+            self.value.seek(0)
+
+    def _set_value_from_chunked_stream(self, value: IO[bytes], decoded_length: int):
+        with self.lock:
+            self.value.seek(0)
+            self.value.truncate()
+            # We have 2 cases:
+            # The client gave a checksum value, we will need to compute the value and validate it against
+            # or the client have an algorithm value only and we need to compute the checksum
+            checksum = None
+            calculated_checksum = None
+            if self.checksum_algorithm:
+                checksum = get_s3_checksum(self.checksum_algorithm)
+            etag = hashlib.md5(usedforsecurity=False)
+
+            written = 0
+            while written < decoded_length:
+                line = value.readline()
+                chunk_length = int(line.split(b";")[0], 16)
+
+                while chunk_length > 0:
+                    amount = min(chunk_length, S3_CHUNK_SIZE)
+                    data = value.read(amount)
+                    self.value.write(data)
+
+                    real_amount = len(data)
+                    chunk_length -= real_amount
+                    written += real_amount
+
+                    etag.update(data)
+                    if self.checksum_algorithm:
+                        checksum.update(data)
+
+                # remove trailing \r\n
+                value.read(2)
+
+            trailing_headers = []
+            next_line = value.readline()
+
+            if next_line:
+                try:
+                    chunk_length = int(next_line.split(b";")[0], 16)
+                    if chunk_length != 0:
+                        LOG.warning("The S3 object body didn't conform to the aws-chunk format")
+                except ValueError:
+                    trailing_headers.append(next_line.strip())
+
+                # try for trailing headers after
+                while line := value.readline():
+                    trailing_header = line.strip()
+                    if trailing_header:
+                        trailing_headers.append(trailing_header)
+
+            # look for the checksum header in the trailing headers
+            # TODO: we could get the header key from x-amz-trailer as well
+            for trailing_header in trailing_headers:
+                try:
+                    header_key, header_value = trailing_header.decode("utf-8").split(
+                        ":", maxsplit=1
+                    )
+                    if header_key.lower() == f"x-amz-checksum-{self.checksum_algorithm}".lower():
+                        self.checksum_value = header_value
+                except (IndexError, ValueError, AttributeError):
+                    continue
+
+            if self.checksum_algorithm:
+                calculated_checksum = base64.b64encode(checksum.digest()).decode()
+
+            if self.checksum_value and self.checksum_value != calculated_checksum:
+                raise InvalidRequest(
+                    f"Value for x-amz-checksum-{self.checksum_algorithm.lower()} header is invalid."
+                )
+
+            self.etag = etag.hexdigest()
+            self.contentsize = self.value.tell()
+            self.value.seek(0)
+
+    def get_metadata_headers(self):
+        headers = Headers()
+        headers["Last-Modified"] = self.last_modified_rfc1123
+        if self.expires:
+            headers["Expires"] = self.expires_rfc1123
+
+        for metadata_key, metadata_value in self.metadata.items():
+            headers[metadata_key] = metadata_value
+
+    @property
+    def last_modified_iso8601(self) -> str:
+        return iso_8601_datetime_without_milliseconds_s3(self.last_modified)  # type: ignore
+
+    @property
+    def last_modified_rfc1123(self) -> str:
+        # Different datetime formats depending on how the key is obtained
+        # https://github.com/boto/boto/issues/466
+        return rfc_1123_datetime(self.last_modified)
+
+    @property
+    def expires_rfc1123(self) -> str:
+        return rfc_1123_datetime(self.expires)
 
 
 class S3DeleteMarker:
@@ -234,6 +407,19 @@ class _VersionedKeyStore(dict):  # type: ignore
             self.__sgetitem__(key)[-1] = value
         except (KeyError, IndexError):
             super().__setitem__(key, [value])
+
+    def get_version(
+        self, key: str, version_id: str, default: S3Object | S3DeleteMarker = None
+    ) -> Optional[S3Object | S3DeleteMarker]:
+        s3_object_versions = self.getlist(key=key, default=default)
+        if not s3_object_versions:
+            return default
+
+        for s3_object_version in s3_object_versions:
+            if s3_object_version.version_id == version_id:
+                return s3_object_version
+
+        return None
 
     def getlist(
         self, key: str, default: list[S3Object | S3DeleteMarker] = None

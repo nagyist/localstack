@@ -36,7 +36,13 @@ from localstack.services.s3.exceptions import (
     InvalidLocationConstraint,
     MalformedXML,
 )
-from localstack.services.s3.models_v2 import S3Bucket, S3Object, S3StoreV2, s3_stores_v2
+from localstack.services.s3.models_v2 import (
+    S3Bucket,
+    S3DeleteMarker,
+    S3Object,
+    S3StoreV2,
+    s3_stores_v2,
+)
 from localstack.services.s3.utils import (
     get_class_attrs_from_spec_class,
     get_full_default_bucket_location,
@@ -244,6 +250,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
             key=key,
             value=request.get("Body"),
             storage_class=storage_class,
+            expires=request.get("Expires"),
             metadata=metadata,
             checksum_algorithm=checksum_algorithm,
             checksum_value=request.get(f"Checksum{checksum_algorithm.upper()}"),
@@ -254,6 +261,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
             lock_legal_status=request.get("ObjectLockLegalHoldStatus"),
             lock_until=request.get("ObjectLockRetainUntilDate"),
             acl=None,
+            expiration=None,  # TODO, from lifecycle, or should it be updated with config?
         )
 
         existing_s3_object = s3_bucket.objects.get(key)
@@ -261,6 +269,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         if existing_s3_object:
             existing_s3_object.is_current = False
 
+        # TODO: update versioning to include None, Enabled, Suspended
         if s3_bucket.versioning_status:
             # the bucket versioning is enabled, add the key to the list
             s3_bucket.objects[key] = s3_key
@@ -270,32 +279,40 @@ class S3Provider(S3Api, ServiceLifecycleHook):
             s3_bucket.objects.set_last_version(key=key, value=s3_key)
 
         # TODO: fields
-        # Expiration: Optional[Expiration]
-        # ETag: Optional[ETag]
-        # ChecksumCRC32: Optional[ChecksumCRC32]
-        # ChecksumCRC32C: Optional[ChecksumCRC32C]
-        # ChecksumSHA1: Optional[ChecksumSHA1]
-        # ChecksumSHA256: Optional[ChecksumSHA256]
-        # ServerSideEncryption: Optional[ServerSideEncryption]
-        # VersionId: Optional[ObjectVersionId]
-        # SSECustomerAlgorithm: Optional[SSECustomerAlgorithm]
-        # SSECustomerKeyMD5: Optional[SSECustomerKeyMD5]
-        # SSEKMSKeyId: Optional[SSEKMSKeyId]
-        # SSEKMSEncryptionContext: Optional[SSEKMSEncryptionContext]
-        # BucketKeyEnabled: Optional[BucketKeyEnabled]
-        # RequestCharged: Optional[RequestCharged]
+        # Expiration: Optional[Expiration] TODO
+        # ETag: Optional[ETag] OK
+        # ChecksumCRC32: Optional[ChecksumCRC32] OK
+        # ChecksumCRC32C: Optional[ChecksumCRC32C] OK
+        # ChecksumSHA1: Optional[ChecksumSHA1] OK
+        # ChecksumSHA256: Optional[ChecksumSHA256] OK
+        # ServerSideEncryption: Optional[ServerSideEncryption] OK
+        # VersionId: Optional[ObjectVersionId] OK
+        # SSECustomerAlgorithm: Optional[SSECustomerAlgorithm] ?
+        # SSECustomerKeyMD5: Optional[SSECustomerKeyMD5] ?
+        # SSEKMSKeyId: Optional[SSEKMSKeyId] OK
+        # SSEKMSEncryptionContext: Optional[SSEKMSEncryptionContext] ?
+        # BucketKeyEnabled: Optional[BucketKeyEnabled] OK
+        # RequestCharged: Optional[RequestCharged]  # TODO
         response = PutObjectOutput(
             ETag=s3_key.etag,
         )
+        if s3_key.version_id:  # TODO: better way?
+            response["VersionId"] = s3_key.version_id
+
         if s3_key.checksum_algorithm:
             response[f"Checksum{checksum_algorithm.upper()}"] = s3_key.checksum_value
-        if s3_key.expiry:
-            response["Expiration"] = s3_key.expiry  # TODO: properly parse the datetime
+
+        if s3_key.expiration:
+            response["Expiration"] = s3_key.expiration  # TODO: properly parse the datetime
+
         if s3_key.encryption:
             response["ServerSideEncryption"] = s3_key.encryption
             if s3_key.encryption == ServerSideEncryption.aws_kms:
-                # Add key and bucket key enabled
-                pass
+                if s3_key.kms_key_id is not None:
+                    # TODO: see S3 AWS managed KMS key if not provided
+                    response["SSEKMSKeyId"] = s3_key.kms_key_id
+                if s3_key.bucket_key_enabled is not None:
+                    response["BucketKeyEnabled"] = s3_key.bucket_key_enabled
 
         return response
 
@@ -326,7 +343,72 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         # expected_bucket_owner: AccountId = None,
         # checksum_mode: ChecksumMode = None,
     ) -> GetObjectOutput:
-        pass
+        # TODO: might add x-robot for system metadata??
+        # Body: Optional[Union[Body, IO[Body], Iterable[Body]]]
+        #     DeleteMarker: Optional[DeleteMarker] # TODO: this is on the NotFound exception actually?
+        #     AcceptRanges: Optional[AcceptRanges]
+        #     Expiration: Optional[Expiration]
+        #     Restore: Optional[Restore]
+        #     LastModified: Optional[LastModified]
+        #     ContentLength: Optional[ContentLength]
+        #     ETag: Optional[ETag]
+        #     ChecksumCRC32: Optional[ChecksumCRC32]
+        #     ChecksumCRC32C: Optional[ChecksumCRC32C]
+        #     ChecksumSHA1: Optional[ChecksumSHA1]
+        #     ChecksumSHA256: Optional[ChecksumSHA256]
+        #     MissingMeta: Optional[MissingMeta]
+        #     VersionId: Optional[ObjectVersionId]
+        #     CacheControl: Optional[CacheControl]
+        #     ContentDisposition: Optional[ContentDisposition]
+        #     ContentEncoding: Optional[ContentEncoding]
+        #     ContentLanguage: Optional[ContentLanguage]
+        #     ContentRange: Optional[ContentRange]
+        #     ContentType: Optional[ContentType]
+        #     Expires: Optional[Expires]
+        #     WebsiteRedirectLocation: Optional[WebsiteRedirectLocation]
+        #     ServerSideEncryption: Optional[ServerSideEncryption]
+        #     Metadata: Optional[Metadata]
+        #     SSECustomerAlgorithm: Optional[SSECustomerAlgorithm]
+        #     SSECustomerKeyMD5: Optional[SSECustomerKeyMD5]
+        #     SSEKMSKeyId: Optional[SSEKMSKeyId]
+        #     BucketKeyEnabled: Optional[BucketKeyEnabled]
+        #     StorageClass: Optional[StorageClass]
+        #     RequestCharged: Optional[RequestCharged]
+        #     ReplicationStatus: Optional[ReplicationStatus]
+        #     PartsCount: Optional[PartsCount]
+        #     TagCount: Optional[TagCount]
+        #     ObjectLockMode: Optional[ObjectLockMode]
+        #     ObjectLockRetainUntilDate: Optional[ObjectLockRetainUntilDate]
+        #     ObjectLockLegalHoldStatus: Optional[ObjectLockLegalHoldStatus]
+        #     StatusCode: Optional[GetObjectResponseStatusCode]
+
+        store = self.get_store(context.account_id, context.region)
+        bucket_name = request["Bucket"]
+        object_key = request["Key"]
+        if not (s3_bucket := store.buckets.get(bucket_name)):
+            raise NoSuchBucket("The specified bucket does not exist", BucketName=bucket_name)
+
+        if version_id := request.get("VersionId"):
+            if s3_bucket.versioning_status:
+                s3_object = s3_bucket.objects.get_version(key=object_key, version_id=version_id)
+            else:
+                # TODO
+                # can you provide a version id to a bucket with never activated versioning?
+                s3_object = s3_bucket.objects.get(key=object_key)
+                pass
+        else:
+            s3_object = s3_bucket.objects.get(key=object_key)
+
+        if not s3_object:
+            pass
+        if isinstance(s3_object, S3DeleteMarker):
+            pass
+
+        response = GetObjectOutput(
+            ETag=s3_object.etag,
+        )
+
+        return response
 
     @handler("HeadObject", expand=False)
     def head_object(

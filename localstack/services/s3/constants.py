@@ -1,6 +1,7 @@
 from localstack.aws.api.s3 import BucketCannedACL, ObjectCannedACL, Permission, StorageClass
 
 S3_VIRTUAL_HOST_FORWARDED_HEADER = "x-s3-vhost-forwarded-for"
+S3_CHUNK_SIZE = 65536
 
 VALID_CANNED_ACLS_BUCKET = {
     # https://docs.aws.amazon.com/AmazonS3/latest/userguide/acl-overview.html#canned-acl
