@@ -1,4 +1,3 @@
-import base64
 import datetime
 import logging
 import os
@@ -128,11 +127,10 @@ from localstack.services.s3.presigned_url import (
 from localstack.services.s3.utils import (
     _create_invalid_argument_exc,
     capitalize_header_name_from_snake_case,
-    extract_bucket_key_version_id_from_copy_source,
     get_bucket_from_moto,
     get_header_name,
     get_key_from_moto_bucket,
-    get_s3_checksum,
+    get_object_checksum_for_algorithm,
     is_bucket_name_valid,
     is_canned_acl_bucket_valid,
     is_key_expired,
@@ -156,7 +154,6 @@ os.environ[
 
 MOTO_CANONICAL_USER_ID = "75aa57f09aa0c8caeab4f8c24e99d10f8e7faeebf76c078efc7c6caea54ba06a"
 # max file size for S3 objects kept in memory (500 KB by default)
-# TODO: make this configurable
 S3_MAX_FILE_SIZE_BYTES = 512 * 1024
 
 
@@ -390,7 +387,6 @@ class S3Provider(S3Api, ServiceLifecycleHook):
             raise NoSuchKey("The specified key does not exist.", Key=key)
 
         response: GetObjectOutput = call_moto(context)
-
         # check for the presence in the response, was fixed by moto but incompletely
         if bucket in self.get_store().bucket_versioning_status and "VersionId" not in response:
             response["VersionId"] = "null"
@@ -413,17 +409,16 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         if request.get("ChecksumMode") == "ENABLED" and checksum_algorithm:
             # TODO: moto does not store the checksum of object, there is a TODO there as well
             # in the meantime, just compute the hash everytime it's requested
-            # checksum = get_object_checksum_for_algorithm(
-            #     checksum_algorithm=checksum_algorithm,
-            #     data=key_object.value,
-            # )
-            response[f"Checksum{checksum_algorithm.upper()}"] = key_object.checksum_value  # noqa
+            checksum = get_object_checksum_for_algorithm(
+                checksum_algorithm=checksum_algorithm,
+                data=key_object.value,
+            )
+            response[f"Checksum{checksum_algorithm.upper()}"] = checksum  # noqa
 
         response["AcceptRanges"] = "bytes"
         return response
 
     @handler("PutObject", expand=False)
-    # @profile
     def put_object(
         self,
         context: RequestContext,
@@ -432,8 +427,6 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         # TODO: it seems AWS uses AES256 encryption by default now, starting January 5th 2023
         # note: etag do not change after encryption
         # https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-encryption.html
-
-        # TODO: move this into moto when we save the key
         if checksum_algorithm := request.get("ChecksumAlgorithm"):
             verify_checksum(checksum_algorithm, context.request.data, request)
 
@@ -458,7 +451,6 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         # we set it to the correctly parsed value in Request, else we remove it from moto metadata
         # we are getting the last set key here so no need for versionId when getting the key
         key_object = get_key_from_moto_bucket(moto_bucket, key=request["Key"])
-
         if expires := request.get("Expires"):
             key_object.set_expiry(expires)
         elif "expires" in key_object.metadata:  # if it got added from query string parameter
@@ -474,10 +466,8 @@ class S3Provider(S3Api, ServiceLifecycleHook):
             )
             response["SSEKMSKeyId"] = key_object.kms_key_id
 
-        if key_object.checksum_algorithm:
-            response[f"Checksum{key_object.checksum_algorithm.upper()}"] = key_object.checksum_value
-
         self._notify(context)
+
         return response
 
     @handler("CopyObject", expand=False)
@@ -486,45 +476,12 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         context: RequestContext,
         request: CopyObjectRequest,
     ) -> CopyObjectOutput:
-        moto_backend = get_moto_s3_backend(context)
-        dest_moto_bucket = get_bucket_from_moto(moto_backend, bucket=request["Bucket"])
         if not config.S3_SKIP_KMS_KEY_VALIDATION and (sse_kms_key_id := request.get("SSEKMSKeyId")):
-            validate_kms_key_id(sse_kms_key_id, dest_moto_bucket)
+            moto_backend = get_moto_s3_backend(context)
+            bucket = get_bucket_from_moto(moto_backend, bucket=request["Bucket"])
+            validate_kms_key_id(sse_kms_key_id, bucket)
 
         response: CopyObjectOutput = call_moto(context)
-
-        # moto does not copy all attributes of the key
-        src_bucket, src_key, src_version_id = extract_bucket_key_version_id_from_copy_source(
-            request["CopySource"]
-        )
-        src_moto_bucket = get_bucket_from_moto(moto_backend, bucket=src_bucket)
-        source_key_object = get_key_from_moto_bucket(
-            src_moto_bucket, key=src_key, version_id=src_version_id
-        )
-
-        checksum_algorithm = (
-            request.get("ChecksumAlgorithm") or source_key_object.checksum_algorithm
-        )
-        if checksum_algorithm:
-            # this is a bug in AWS: it sets the content encoding header to an empty string (parity tested)
-            dest_key_object = get_key_from_moto_bucket(dest_moto_bucket, key=request["Key"])
-            dest_key_object.checksum_algorithm = checksum_algorithm
-
-            if not source_key_object.checksum_value:
-                stream_value = source_key_object.value
-                checksum = get_s3_checksum(checksum_algorithm)
-                checksum.update(stream_value)
-
-                calculated_checksum = base64.b64encode(checksum.digest()).decode()
-                dest_key_object.checksum_value = calculated_checksum
-            else:
-                dest_key_object.checksum_value = source_key_object.checksum_value
-            dest_key_object.checksum_algorithm = checksum_algorithm
-
-            response["CopyObjectResult"][
-                f"Checksum{checksum_algorithm.upper()}"
-            ] = dest_key_object.checksum_value  # noqa
-
         self._notify(context)
         return response
 
@@ -652,9 +609,6 @@ class S3Provider(S3Api, ServiceLifecycleHook):
                 "The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.",
                 UploadId=upload_id,
             )
-        elif request.get("PartNumber", 0) < 1:
-            # TODO: find the right exception for this?
-            raise NoSuchUpload()
 
         response: UploadPartOutput = call_moto(context)
         return response
@@ -1216,13 +1170,11 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         if "Checksum" in object_attrs and (checksum_algorithm := key.checksum_algorithm):
             # TODO: moto does not store the checksum of object, there is a TODO there as well
             # in the meantime, just compute the hash everytime it's requested
-            # checksum = get_object_checksum_for_algorithm(
-            #     checksum_algorithm=checksum_algorithm,
-            #     data=key.value,
-            # )
-            response["Checksum"] = {
-                f"Checksum{checksum_algorithm.upper()}": key.checksum_value
-            }  # noqa
+            checksum = get_object_checksum_for_algorithm(
+                checksum_algorithm=checksum_algorithm,
+                data=key.value,
+            )
+            response["Checksum"] = {f"Checksum{checksum_algorithm.upper()}": checksum}  # noqa
 
         response["LastModified"] = key.last_modified
 
