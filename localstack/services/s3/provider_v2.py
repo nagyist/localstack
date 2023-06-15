@@ -603,8 +603,14 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         response = DeleteObjectOutput(VersionId=found_object.version_id)
         # object versions is directly mutable, so we can directly remove the Object
         # to avoid concurrency issue, we will remove and not pop from the index
+        # TODO: implementing locking, locked dict from persistence?
         with contextlib.suppress(ValueError):
             object_versions.remove(found_object)
+
+        # if the list is now empty, pop the key entry
+        if not object_versions:
+            s3_bucket.objects.pop(key)
+
         if isinstance(found_object, S3DeleteMarker):
             response["DeleteMarker"] = True
 

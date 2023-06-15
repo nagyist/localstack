@@ -504,6 +504,15 @@ class _VersionedKeyStore(dict):  # type: ignore
         if value.version_id:
             self._stored_versions[key].add(value.version_id)
 
+    def pop(
+        self, key: str, default: S3Object | S3DeleteMarker = None
+    ) -> list[S3Object | S3DeleteMarker]:
+        value = super().pop(key, None)
+        if not value:
+            return [default]
+        self._stored_versions.pop(key, None)
+        return value
+
     def get(self, key: str, default: S3Object | S3DeleteMarker = None) -> S3Object | S3DeleteMarker:
         """
         :param key: the ObjectKey
@@ -525,6 +534,7 @@ class _VersionedKeyStore(dict):  # type: ignore
             self[key] = default
         return default
 
+    # TODO: could it actually append one version on top instead? hmm
     def set_last_version(self, key: str, value: S3Object | S3DeleteMarker) -> None:
         try:
             self.__sgetitem__(key)[-1] = value
@@ -558,7 +568,10 @@ class _VersionedKeyStore(dict):  # type: ignore
             if value.version_id:
                 self._stored_versions[key].add(value.version_id)
 
-        super().__setitem__(key, _list)
+        if _list:
+            super().__setitem__(key, _list)
+        else:
+            self.pop(key)
 
     def _iteritems(self) -> Iterator[tuple[str, S3Object | S3DeleteMarker]]:
         for key in self._self_iterable():
@@ -591,9 +604,9 @@ class _VersionedKeyStore(dict):  # type: ignore
         #  TODO: look into replacing with a locking mechanism, potentially
         return dict(self)
 
-    items = iteritems = _iteritems  # type: ignore
+    items = iteritems = _iteritems
     lists = iterlists = _iterlists
-    values = itervalues = _itervalues  # type: ignore
+    values = itervalues = _itervalues
 
 
 class S3StoreV2(BaseStore):
