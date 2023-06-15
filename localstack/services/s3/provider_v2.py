@@ -1,19 +1,21 @@
 # from typing import Optional
+import contextlib
 
 from localstack import config
 
 # from localstack.aws.api import CommonServiceException, RequestContext, ServiceException, handler
 from localstack.aws.api import RequestContext, handler
-from localstack.aws.api.s3 import (  # BucketName, CreateBucketConfiguration,; InvalidBucketName,
+from localstack.aws.api.s3 import (  # BucketName, CreateBucketConfiguration,; InvalidBucketName,; DeleteObjectRequest,
+    MFA,
     AccountId,
     Bucket,
     BucketAlreadyExists,
     BucketAlreadyOwnedByYou,
     BucketName,
+    BypassGovernanceRetention,
     CreateBucketOutput,
     CreateBucketRequest,
     DeleteObjectOutput,
-    DeleteObjectRequest,
     DeleteObjectsOutput,
     DeleteObjectsRequest,
     GetObjectAttributesOutput,
@@ -24,11 +26,15 @@ from localstack.aws.api.s3 import (  # BucketName, CreateBucketConfiguration,; I
     HeadBucketOutput,
     HeadObjectOutput,
     HeadObjectRequest,
+    InvalidArgument,
     InvalidStorageClass,
     ListBucketsOutput,
     NoSuchBucket,
+    ObjectKey,
+    ObjectVersionId,
     PutObjectOutput,
     PutObjectRequest,
+    RequestPayer,
     S3Api,
     ServerSideEncryption,
     StorageClass,
@@ -139,6 +145,8 @@ class S3Provider(S3Api, ServiceLifecycleHook):
 
         # the bucket still contains objects
         if s3_bucket.objects:
+            # TODO: try with a key containing only DeleteMarker?
+
             # TODO: aws validate once we implemented objects
             raise BucketNotEmpty(
                 message="The bucket you tried to delete is not empty",
@@ -173,6 +181,11 @@ class S3Provider(S3Api, ServiceLifecycleHook):
 
         # TODO: this call is also used to check if the user has access/authorization for the bucket, it can return 403
         return HeadBucketOutput(BucketRegion=s3_bucket.bucket_region)
+
+    # def get_bucket_location(
+    #     self, context: RequestContext, bucket: BucketName, expected_bucket_owner: AccountId = None
+    # ) -> GetBucketLocationOutput:
+    #     pass
 
     @handler("PutObject", expand=False)
     def put_object(
@@ -412,21 +425,11 @@ class S3Provider(S3Api, ServiceLifecycleHook):
 
         # TODO implement PartNumber once multipart is done
 
-        if version_id := request.get("VersionId"):
-            if s3_bucket.versioning_status:
-                s3_object = s3_bucket.objects.get_version(key=object_key, version_id=version_id)
-            else:
-                # TODO
-                # can you provide a version id to a bucket with never activated versioning?
-                s3_object = s3_bucket.objects.get(key=object_key)
-                pass
-        else:
-            s3_object = s3_bucket.objects.get(key=object_key)
-
-        if not s3_object:
-            pass
-        if isinstance(s3_object, S3DeleteMarker):
-            pass
+        s3_object = s3_bucket.get_object(
+            key=object_key,
+            version_id=request.get("VersionId"),
+            http_method="GET",
+        )
 
         # TODO implement special logic in serializer for S3, no specs for `x-amz-meta` headers, pass them as is
         # or maybe it's Metadata field? check and implement sysem/user metadata separation
@@ -480,21 +483,11 @@ class S3Provider(S3Api, ServiceLifecycleHook):
             raise NoSuchBucket("The specified bucket does not exist", BucketName=bucket_name)
 
         # TODO implement PartNumber, don't know about part number + version id?
-        if version_id := request.get("VersionId"):
-            if s3_bucket.versioning_status:
-                s3_object = s3_bucket.objects.get_version(key=object_key, version_id=version_id)
-            else:
-                # TODO
-                # can you provide a version id to a bucket with never activated versioning?
-                s3_object = s3_bucket.objects.get(key=object_key)
-                pass
-        else:
-            s3_object = s3_bucket.objects.get(key=object_key)
-
-        if not s3_object:
-            pass
-        if isinstance(s3_object, S3DeleteMarker):
-            pass
+        s3_object = s3_bucket.get_object(
+            key=object_key,
+            version_id=request.get("VersionId"),
+            http_method="GET",
+        )
 
         # DeleteMarker: Optional[DeleteMarker]
         # AcceptRanges: Optional[AcceptRanges]
@@ -546,22 +539,76 @@ class S3Provider(S3Api, ServiceLifecycleHook):
             range_data = parse_range_header(range_header, s3_object.size)
             response["ContentLength"] = range_data.content_length
 
+        if s3_object.parts is not None:
+            response["PartsCount"] = len(s3_object.parts)
+
+        if s3_object.version_id:
+            response["VersionId"] = s3_object.version_id
+
         return response
 
-    @handler("DeleteObject", expand=False)
+    # @handler("DeleteObject", expand=False)
     def delete_object(
         self,
         context: RequestContext,
-        request: DeleteObjectRequest,
-        # bucket: BucketName,
-        # key: ObjectKey,
-        # mfa: MFA = None,
-        # version_id: ObjectVersionId = None,
-        # request_payer: RequestPayer = None,
-        # bypass_governance_retention: BypassGovernanceRetention = None,
-        # expected_bucket_owner: AccountId = None,
+        # request: DeleteObjectRequest,
+        bucket: BucketName,
+        key: ObjectKey,
+        mfa: MFA = None,
+        version_id: ObjectVersionId = None,
+        request_payer: RequestPayer = None,
+        bypass_governance_retention: BypassGovernanceRetention = None,
+        expected_bucket_owner: AccountId = None,
     ) -> DeleteObjectOutput:
-        pass
+        # TODO: implement bypass_governance_retention, it is done in moto
+        store = self.get_store(context.account_id, context.region)
+        if not (s3_bucket := store.buckets.get(bucket)):
+            raise NoSuchBucket("The specified bucket does not exist", BucketName=bucket)
+
+        # TODO: try if specifying VersionId to a never versioned bucket??
+        if s3_bucket.versioning_status is None:  # never been versioned TODO: test
+            s3_bucket.objects.pop(key, None)
+            # TODO: RequestCharged
+            return DeleteObjectOutput()
+
+        if not version_id:
+            delete_marker = S3DeleteMarker(key=key)
+            # TODO: verify with Suspended bucket? does it override last version or still append?? big question
+            # append the DeleteMaker to the objects stack
+            # if the key does not exist already, AWS does not care and just append a DeleteMarker anyway
+            s3_bucket.objects[key] = delete_marker
+            return DeleteObjectOutput(VersionId=delete_marker.version_id, DeleteMarker=True)
+
+        if (
+            not (existed_versions := s3_bucket.objects.get_versions_for_key(key))
+            or version_id not in existed_versions
+        ):
+            raise InvalidArgument(
+                "Invalid version id specified",
+                ArgumentName="versionId",
+                ArgumentValue=version_id,
+            )
+
+        object_versions = s3_bucket.objects.getlist(key=key)
+
+        found_object = None
+        # TODO: probably use a lock, the list might change size as it's mutable
+        for object_version in object_versions:
+            if object_version.version_id == version_id:
+                found_object = object_version
+
+        if not found_object:
+            return DeleteObjectOutput()
+
+        response = DeleteObjectOutput(VersionId=found_object.version_id)
+        # object versions is directly mutable, so we can directly remove the Object
+        # to avoid concurrency issue, we will remove and not pop from the index
+        with contextlib.suppress(ValueError):
+            object_versions.remove(found_object)
+        if isinstance(found_object, S3DeleteMarker):
+            response["DeleteMarker"] = True
+
+        return response
 
     @handler("DeleteObjects", expand=False)
     def delete_objects(
@@ -655,6 +702,20 @@ class S3Provider(S3Api, ServiceLifecycleHook):
     # ) -> ListObjectsV2Output:
     #     pass
 
+    # def list_object_versions(
+    #     self,
+    #     context: RequestContext,
+    #     bucket: BucketName,
+    #     delimiter: Delimiter = None,
+    #     encoding_type: EncodingType = None,
+    #     key_marker: KeyMarker = None,
+    #     max_keys: MaxKeys = None,
+    #     prefix: Prefix = None,
+    #     version_id_marker: VersionIdMarker = None,
+    #     expected_bucket_owner: AccountId = None,
+    # ) -> ListObjectVersionsOutput:
+    #     pass
+
     @handler("GetObjectAttributes", expand=False)
     def get_object_attributes(
         self,
@@ -669,21 +730,11 @@ class S3Provider(S3Api, ServiceLifecycleHook):
 
         # TODO implement PartNumber once multipart is done
 
-        if version_id := request.get("VersionId"):
-            if s3_bucket.versioning_status:
-                s3_object = s3_bucket.objects.get_version(key=object_key, version_id=version_id)
-            else:
-                # TODO
-                # can you provide a version id to a bucket with never activated versioning?
-                s3_object = s3_bucket.objects.get(key=object_key)
-                pass
-        else:
-            s3_object = s3_bucket.objects.get(key=object_key)
-
-        if not s3_object:
-            pass
-        if isinstance(s3_object, S3DeleteMarker):
-            pass
+        s3_object = s3_bucket.get_object(
+            key=object_key,
+            version_id=request.get("VersionId"),
+            http_method="GET",
+        )
 
         object_attrs = request.get("ObjectAttributes", [])
         response = GetObjectAttributesOutput()
@@ -710,14 +761,163 @@ class S3Provider(S3Api, ServiceLifecycleHook):
 
         return response
 
-    #
-    #
-    # def get_bucket_location(
-    #     self, context: RequestContext, bucket: BucketName, expected_bucket_owner: AccountId = None
-    # ) -> GetBucketLocationOutput:
+    # def restore_object(
+    #     self,
+    #     context: RequestContext,
+    #     bucket: BucketName,
+    #     key: ObjectKey,
+    #     version_id: ObjectVersionId = None,
+    #     restore_request: RestoreRequest = None,
+    #     request_payer: RequestPayer = None,
+    #     checksum_algorithm: ChecksumAlgorithm = None,
+    #     expected_bucket_owner: AccountId = None,
+    # ) -> RestoreObjectOutput:
     #     pass
-    #
-    #
+
+    # def create_multipart_upload(
+    #     self,
+    #     context: RequestContext,
+    #     bucket: BucketName,
+    #     key: ObjectKey,
+    #     acl: ObjectCannedACL = None,
+    #     cache_control: CacheControl = None,
+    #     content_disposition: ContentDisposition = None,
+    #     content_encoding: ContentEncoding = None,
+    #     content_language: ContentLanguage = None,
+    #     content_type: ContentType = None,
+    #     expires: Expires = None,
+    #     grant_full_control: GrantFullControl = None,
+    #     grant_read: GrantRead = None,
+    #     grant_read_acp: GrantReadACP = None,
+    #     grant_write_acp: GrantWriteACP = None,
+    #     metadata: Metadata = None,
+    #     server_side_encryption: ServerSideEncryption = None,
+    #     storage_class: StorageClass = None,
+    #     website_redirect_location: WebsiteRedirectLocation = None,
+    #     sse_customer_algorithm: SSECustomerAlgorithm = None,
+    #     sse_customer_key: SSECustomerKey = None,
+    #     sse_customer_key_md5: SSECustomerKeyMD5 = None,
+    #     ssekms_key_id: SSEKMSKeyId = None,
+    #     ssekms_encryption_context: SSEKMSEncryptionContext = None,
+    #     bucket_key_enabled: BucketKeyEnabled = None,
+    #     request_payer: RequestPayer = None,
+    #     tagging: TaggingHeader = None,
+    #     object_lock_mode: ObjectLockMode = None,
+    #     object_lock_retain_until_date: ObjectLockRetainUntilDate = None,
+    #     object_lock_legal_hold_status: ObjectLockLegalHoldStatus = None,
+    #     expected_bucket_owner: AccountId = None,
+    #     checksum_algorithm: ChecksumAlgorithm = None,
+    # ) -> CreateMultipartUploadOutput:
+    #     pass
+
+    # def upload_part(
+    #     self,
+    #     context: RequestContext,
+    #     bucket: BucketName,
+    #     key: ObjectKey,
+    #     part_number: PartNumber,
+    #     upload_id: MultipartUploadId,
+    #     body: IO[Body] = None,
+    #     content_length: ContentLength = None,
+    #     content_md5: ContentMD5 = None,
+    #     checksum_algorithm: ChecksumAlgorithm = None,
+    #     checksum_crc32: ChecksumCRC32 = None,
+    #     checksum_crc32_c: ChecksumCRC32C = None,
+    #     checksum_sha1: ChecksumSHA1 = None,
+    #     checksum_sha256: ChecksumSHA256 = None,
+    #     sse_customer_algorithm: SSECustomerAlgorithm = None,
+    #     sse_customer_key: SSECustomerKey = None,
+    #     sse_customer_key_md5: SSECustomerKeyMD5 = None,
+    #     request_payer: RequestPayer = None,
+    #     expected_bucket_owner: AccountId = None,
+    # ) -> UploadPartOutput:
+    #     pass
+
+    # def upload_part_copy(
+    #     self,
+    #     context: RequestContext,
+    #     bucket: BucketName,
+    #     copy_source: CopySource,
+    #     key: ObjectKey,
+    #     part_number: PartNumber,
+    #     upload_id: MultipartUploadId,
+    #     copy_source_if_match: CopySourceIfMatch = None,
+    #     copy_source_if_modified_since: CopySourceIfModifiedSince = None,
+    #     copy_source_if_none_match: CopySourceIfNoneMatch = None,
+    #     copy_source_if_unmodified_since: CopySourceIfUnmodifiedSince = None,
+    #     copy_source_range: CopySourceRange = None,
+    #     sse_customer_algorithm: SSECustomerAlgorithm = None,
+    #     sse_customer_key: SSECustomerKey = None,
+    #     sse_customer_key_md5: SSECustomerKeyMD5 = None,
+    #     copy_source_sse_customer_algorithm: CopySourceSSECustomerAlgorithm = None,
+    #     copy_source_sse_customer_key: CopySourceSSECustomerKey = None,
+    #     copy_source_sse_customer_key_md5: CopySourceSSECustomerKeyMD5 = None,
+    #     request_payer: RequestPayer = None,
+    #     expected_bucket_owner: AccountId = None,
+    #     expected_source_bucket_owner: AccountId = None,
+    # ) -> UploadPartCopyOutput:
+    #     pass
+
+    # def complete_multipart_upload(
+    #     self,
+    #     context: RequestContext,
+    #     bucket: BucketName,
+    #     key: ObjectKey,
+    #     upload_id: MultipartUploadId,
+    #     multipart_upload: CompletedMultipartUpload = None,
+    #     checksum_crc32: ChecksumCRC32 = None,
+    #     checksum_crc32_c: ChecksumCRC32C = None,
+    #     checksum_sha1: ChecksumSHA1 = None,
+    #     checksum_sha256: ChecksumSHA256 = None,
+    #     request_payer: RequestPayer = None,
+    #     expected_bucket_owner: AccountId = None,
+    #     sse_customer_algorithm: SSECustomerAlgorithm = None,
+    #     sse_customer_key: SSECustomerKey = None,
+    #     sse_customer_key_md5: SSECustomerKeyMD5 = None,
+    # ) -> CompleteMultipartUploadOutput:
+    #     pass
+
+    # def abort_multipart_upload(
+    #     self,
+    #     context: RequestContext,
+    #     bucket: BucketName,
+    #     key: ObjectKey,
+    #     upload_id: MultipartUploadId,
+    #     request_payer: RequestPayer = None,
+    #     expected_bucket_owner: AccountId = None,
+    # ) -> AbortMultipartUploadOutput:
+    #     pass
+
+    # def list_parts(
+    #     self,
+    #     context: RequestContext,
+    #     bucket: BucketName,
+    #     key: ObjectKey,
+    #     upload_id: MultipartUploadId,
+    #     max_parts: MaxParts = None,
+    #     part_number_marker: PartNumberMarker = None,
+    #     request_payer: RequestPayer = None,
+    #     expected_bucket_owner: AccountId = None,
+    #     sse_customer_algorithm: SSECustomerAlgorithm = None,
+    #     sse_customer_key: SSECustomerKey = None,
+    #     sse_customer_key_md5: SSECustomerKeyMD5 = None,
+    # ) -> ListPartsOutput:
+    #     pass
+
+    # def list_multipart_uploads(
+    #     self,
+    #     context: RequestContext,
+    #     bucket: BucketName,
+    #     delimiter: Delimiter = None,
+    #     encoding_type: EncodingType = None,
+    #     key_marker: KeyMarker = None,
+    #     max_uploads: MaxUploads = None,
+    #     prefix: Prefix = None,
+    #     upload_id_marker: UploadIdMarker = None,
+    #     expected_bucket_owner: AccountId = None,
+    # ) -> ListMultipartUploadsOutput:
+    #     pass
+
     # def put_bucket_accelerate_configuration(
     #     self,
     #     context: RequestContext,
@@ -727,12 +927,12 @@ class S3Provider(S3Api, ServiceLifecycleHook):
     #     checksum_algorithm: ChecksumAlgorithm = None,
     # ) -> None:
     #     pass
-    #
+
     # def get_bucket_accelerate_configuration(
     #     self, context: RequestContext, bucket: BucketName, expected_bucket_owner: AccountId = None
     # ) -> GetBucketAccelerateConfigurationOutput:
     #     pass
-    #
+
     # def list_bucket_analytics_configurations(
     #     self,
     #     context: RequestContext,
@@ -750,7 +950,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
     #     expected_bucket_owner: AccountId = None,
     # ) -> None:
     #     pass
-    #
+
     # def put_bucket_acl(
     #     self,
     #     context: RequestContext,

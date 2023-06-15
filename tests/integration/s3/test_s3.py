@@ -7660,11 +7660,3 @@ def _make_url_invalid(url_prefix: str, object_key: str, url: str) -> str:
             query_params["X-Amz-Expires"][0],
             query_params["X-Amz-Signature"][0],
         )
-
-
-class TestS3BucketCRUD:
-    def test_create_bucket(self, s3_create_bucket):
-        pass
-
-    def test_delete_bucket_with_objects(self, s3_bucket, aws_client):
-        pass

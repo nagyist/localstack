@@ -5,9 +5,10 @@ import base64
 import hashlib
 import logging
 import threading
+from collections import defaultdict
 from datetime import datetime
 from tempfile import SpooledTemporaryFile
-from typing import IO, Iterator, Optional
+from typing import IO, Iterator, Literal, Optional
 
 from werkzeug.datastructures.headers import Headers
 
@@ -28,6 +29,9 @@ from localstack.aws.api.s3 import (  # BucketCannedACL,
     LifecycleRules,
     LoggingEnabled,
     Metadata,
+    MethodNotAllowed,
+    NoSuchKey,
+    NoSuchVersion,
     NotificationConfiguration,
     ObjectKey,
     ObjectLockConfiguration,
@@ -146,6 +150,54 @@ class S3Bucket:
         self.versioning_status = None
         # see https://docs.aws.amazon.com/AmazonS3/latest/API/API_Owner.html
         self.owner = get_owner_for_account_id(account_id)
+
+    def get_object(
+        self,
+        key: ObjectKey,
+        version_id: ObjectVersionId = None,
+        http_method: Literal["GET", "PUT"] = "GET",  # TODO: better?
+    ) -> "S3Object":
+        """
+        :param key: the Object Key
+        :param version_id: optional, the versionId of the object
+        :param http_method: the HTTP method of the original call. This is necessary for the exception if the bucket is
+        versioned or suspended
+        see: https://docs.aws.amazon.com/AmazonS3/latest/userguide/DeleteMarker.html
+        :return:
+        :raises NoSuchKey if the object key does not exist at all, or if the object is a DeleteMarker
+        :raises MethodNotAllowed if the object is a DeleteMarker and the operation is not allowed against it
+        """
+        if version_id:
+            s3_object_version = self.objects.get_version(key, version_id)
+            if not s3_object_version:
+                raise NoSuchVersion(
+                    "The specified version does not exist.",
+                    Key=key,
+                    VersionId=version_id,
+                )
+            elif isinstance(s3_object_version, S3DeleteMarker):
+                raise MethodNotAllowed(
+                    "The specified method is not allowed against this resource.",
+                    Method=http_method,
+                    ResourceType="DeleteMarker",
+                    DeleteMarker=True,
+                    Allow="delete",
+                )
+            return s3_object_version
+
+        s3_object = self.objects.get(key)
+
+        if not s3_object:
+            raise NoSuchKey("The specified key does not exist.", Key=key)
+
+        elif isinstance(s3_object, S3DeleteMarker):
+            raise NoSuchKey(
+                "The specified key does not exist.",
+                Key=key,
+                DeleteMarker=True,
+            )
+
+        return s3_object
 
 
 class S3Object:
@@ -405,10 +457,14 @@ class S3Object:
 
 
 class S3DeleteMarker:
-    key: str
+    key: ObjectKey
     version_id: str
     last_modified: datetime
-    pass
+
+    def __init__(self, key: ObjectKey):
+        self.key = key
+        self.version_id = "randomkk"  # TODO
+        self.last_modified = datetime.now()
 
 
 class S3Multipart:
@@ -422,6 +478,14 @@ class S3Part:
 class _VersionedKeyStore(dict):  # type: ignore
 
     """A modified version of Moto's `_VersionedKeyStore`"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._stored_versions = defaultdict(set)
+        self._lock = threading.RLock()
+
+    def get_versions_for_key(self, key: str) -> set[str]:
+        return self._stored_versions.get(key)
 
     def __sgetitem__(self, key: str) -> list[S3Object | S3DeleteMarker]:
         return super().__getitem__(key)
@@ -437,6 +501,8 @@ class _VersionedKeyStore(dict):  # type: ignore
             current = [value]
 
         super().__setitem__(key, current)
+        if value.version_id:
+            self._stored_versions[key].add(value.version_id)
 
     def get(self, key: str, default: S3Object | S3DeleteMarker = None) -> S3Object | S3DeleteMarker:
         """
@@ -488,10 +554,9 @@ class _VersionedKeyStore(dict):  # type: ignore
         return default
 
     def setlist(self, key: str, _list: list[S3Object | S3DeleteMarker]) -> None:
-        if isinstance(_list, tuple):
-            _list = list(_list)
-        elif not isinstance(_list, list):
-            _list = [_list]
+        for value in _list:
+            if value.version_id:
+                self._stored_versions[key].add(value.version_id)
 
         super().__setitem__(key, _list)
 
