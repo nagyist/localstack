@@ -14,6 +14,12 @@ from localstack.aws.api.s3 import (  # BucketName, CreateBucketConfiguration,; I
     BucketName,
     BypassGovernanceRetention,
     ChecksumAlgorithm,
+    ChecksumCRC32,
+    ChecksumCRC32C,
+    ChecksumSHA1,
+    ChecksumSHA256,
+    CompletedMultipartUpload,
+    CompleteMultipartUploadOutput,
     CopyObjectOutput,
     CopyObjectRequest,
     CopyObjectResult,
@@ -34,8 +40,10 @@ from localstack.aws.api.s3 import (  # BucketName, CreateBucketConfiguration,; I
     HeadObjectOutput,
     HeadObjectRequest,
     InvalidArgument,
+    InvalidPartOrder,
     InvalidStorageClass,
     ListBucketsOutput,
+    MultipartUploadId,
     NoSuchBucket,
     NoSuchUpload,
     ObjectKey,
@@ -45,6 +53,9 @@ from localstack.aws.api.s3 import (  # BucketName, CreateBucketConfiguration,; I
     RequestPayer,
     S3Api,
     ServerSideEncryption,
+    SSECustomerAlgorithm,
+    SSECustomerKey,
+    SSECustomerKeyMD5,
     StorageClass,
     UploadPartCopyOutput,
     UploadPartCopyRequest,
@@ -1270,24 +1281,51 @@ class S3Provider(S3Api, ServiceLifecycleHook):
 
         return response
 
-    # def complete_multipart_upload(
-    #     self,
-    #     context: RequestContext,
-    #     bucket: BucketName,
-    #     key: ObjectKey,
-    #     upload_id: MultipartUploadId,
-    #     multipart_upload: CompletedMultipartUpload = None,
-    #     checksum_crc32: ChecksumCRC32 = None,
-    #     checksum_crc32_c: ChecksumCRC32C = None,
-    #     checksum_sha1: ChecksumSHA1 = None,
-    #     checksum_sha256: ChecksumSHA256 = None,
-    #     request_payer: RequestPayer = None,
-    #     expected_bucket_owner: AccountId = None,
-    #     sse_customer_algorithm: SSECustomerAlgorithm = None,
-    #     sse_customer_key: SSECustomerKey = None,
-    #     sse_customer_key_md5: SSECustomerKeyMD5 = None,
-    # ) -> CompleteMultipartUploadOutput:
-    #     pass
+    def complete_multipart_upload(
+        self,
+        context: RequestContext,
+        bucket: BucketName,
+        key: ObjectKey,
+        upload_id: MultipartUploadId,
+        multipart_upload: CompletedMultipartUpload = None,
+        checksum_crc32: ChecksumCRC32 = None,
+        checksum_crc32_c: ChecksumCRC32C = None,
+        checksum_sha1: ChecksumSHA1 = None,
+        checksum_sha256: ChecksumSHA256 = None,
+        request_payer: RequestPayer = None,
+        expected_bucket_owner: AccountId = None,
+        sse_customer_algorithm: SSECustomerAlgorithm = None,
+        sse_customer_key: SSECustomerKey = None,
+        sse_customer_key_md5: SSECustomerKeyMD5 = None,
+    ) -> CompleteMultipartUploadOutput:
+
+        store = self.get_store(context.account_id, context.region)
+        if not (s3_bucket := store.buckets.get(bucket)):
+            raise NoSuchBucket("The specified bucket does not exist", BucketName=bucket)
+
+        if not (s3_multipart := s3_bucket.multiparts.get(upload_id)):
+            raise NoSuchUpload(
+                "The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.",
+                UploadId=upload_id,
+            )
+
+        # TODO: validate key?? is data model wrong??
+        if s3_multipart.object.key != key:
+            pass
+
+        parts = multipart_upload.get("Parts", [])
+        parts_numbers = [part.get("PartNumber") for part in parts]
+        # sorted is very fast (fastest) if the list is already sorted, which should be the case
+        if sorted(parts_numbers) != parts_numbers:
+            raise InvalidPartOrder(
+                "The list of parts was not in ascending order. Parts must be ordered by part number.",
+                UploadId=upload_id,
+            )
+
+        # TODO: validate if you provide wrong checksum compared to the given algorithm? should you calculate it anyway
+        #  when you complete? sounds weird
+
+        pass
 
     # def abort_multipart_upload(
     #     self,

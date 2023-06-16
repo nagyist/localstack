@@ -23,6 +23,7 @@ from localstack.aws.api.s3 import (  # BucketCannedACL,; ServerSideEncryptionRul
     BucketName,
     BucketRegion,
     ChecksumAlgorithm,
+    CompletedPartList,
     CORSConfiguration,
     ETag,
     IntelligentTieringConfiguration,
@@ -55,7 +56,7 @@ from localstack.aws.api.s3 import (  # BucketCannedACL,; ServerSideEncryptionRul
     WebsiteConfiguration,
     WebsiteRedirectLocation,
 )
-from localstack.services.s3.constants import S3_CHUNK_SIZE
+from localstack.services.s3.constants import S3_CHUNK_SIZE, S3_UPLOAD_PART_MIN_SIZE
 from localstack.services.s3.exceptions import InvalidRequest
 from localstack.services.s3.utils import ParsedRange, get_owner_for_account_id, get_s3_checksum
 from localstack.services.stores import (
@@ -630,6 +631,7 @@ class S3Multipart:
     parts: dict[PartNumber, S3Part]
     object: S3Object
     upload_id: MultipartUploadId
+    checksum_value: Optional[str]
 
     def __init__(
         self,
@@ -669,6 +671,55 @@ class S3Multipart:
             acl=acl,
             expiry=expiry,
         )
+        self.checksum_value = None
+
+    def complete_multipart(self, parts: CompletedPartList):
+        last_part_index = len(parts) - 1
+        checksum_key = f"Checksum{self.object.checksum_algorithm.upper()}"
+        object_stream = self.object.value
+        object_etag = hashlib.md5(usedforsecurity=False)
+        for index, part in enumerate(parts):
+            part_number = part["PartNumber"]
+            part_etag = part["ETag"]
+            # TODO: verify checksum part, maybe from the algo?
+            part_checksum = part.get(checksum_key)
+
+            s3_part = self.parts.get(part_number)
+            # TODO: verify etag format here
+            if not s3_part or s3_part.etag != part_etag.strip('"'):
+                object_stream.seek(0)
+                object_stream.truncate()
+                # raise InvalidPart()
+                raise
+            # TODO: validate this?
+            if part_checksum and part_checksum != s3_part.checksum_value:
+                object_stream.seek(0)
+                object_stream.truncate()
+                # raise InvalidPart()
+                raise
+            if index != last_part_index and s3_part.size < S3_UPLOAD_PART_MIN_SIZE:
+                object_stream.seek(0)
+                object_stream.truncate()
+                # raise EntityTooSmall()
+                raise
+
+            stream_value = s3_part.value
+            while data := stream_value.read(S3_CHUNK_SIZE):
+                object_stream.write(data)
+
+            object_etag.update(bytes.fromhex(s3_part.etag))
+
+        multipart_etag = f"{object_etag.hexdigest()}-{len(parts)}"
+        self.object.etag = multipart_etag
+
+        # free the space before the garbage collection, just to be faster
+        for part in self.parts.values():
+            part.value.close()
+
+        # now the full data should be in self.object.value, and the etag set
+        # we can now properly retrieve the S3Object from the S3Multipart, set it as its own key
+        # and delete the multipart
+        # TODO: set the parts list to support `PartNumber` in GetObject !!
 
 
 class _VersionedKeyStore(dict):  # type: ignore
