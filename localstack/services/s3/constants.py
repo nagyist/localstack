@@ -41,6 +41,13 @@ VALID_STORAGE_CLASSES = [
     StorageClass.DEEP_ARCHIVE,
 ]
 
+# TODO validate those?
+ARCHIVES_STORAGE_CLASSES = [
+    StorageClass.GLACIER,
+    StorageClass.GLACIER_IR,
+    StorageClass.DEEP_ARCHIVE,
+]
+
 # response header overrides the client may request
 ALLOWED_HEADER_OVERRIDES = {
     "ResponseContentType": "ContentType",

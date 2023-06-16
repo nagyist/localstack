@@ -7,13 +7,14 @@ import logging
 import threading
 from collections import defaultdict
 from datetime import datetime
+from io import RawIOBase
 from tempfile import SpooledTemporaryFile
 from typing import IO, Iterator, Literal, Optional
 
 from werkzeug.datastructures.headers import Headers
 
 from localstack import config
-from localstack.aws.api.s3 import (  # BucketCannedACL,
+from localstack.aws.api.s3 import (  # BucketCannedACL,; ServerSideEncryptionRules,
     AccountId,
     AnalyticsConfiguration,
     AnalyticsId,
@@ -30,6 +31,7 @@ from localstack.aws.api.s3 import (  # BucketCannedACL,
     LoggingEnabled,
     Metadata,
     MethodNotAllowed,
+    MultipartUploadId,
     NoSuchKey,
     NoSuchVersion,
     NotificationConfiguration,
@@ -40,12 +42,13 @@ from localstack.aws.api.s3 import (  # BucketCannedACL,
     ObjectOwnership,
     ObjectVersionId,
     Owner,
+    PartNumber,
     Payer,
     Policy,
     PublicAccessBlockConfiguration,
     ReplicationConfiguration,
     ServerSideEncryption,
-    ServerSideEncryptionRules,
+    ServerSideEncryptionRule,
     Size,
     SSEKMSKeyId,
     StorageClass,
@@ -103,7 +106,7 @@ class S3Bucket:
     bucket_account_id: AccountId
     bucket_region: BucketRegion
     creation_date: datetime
-    multiparts: dict
+    multiparts: dict[MultipartUploadId, "S3Multipart"]  # TODO: is there a key thing here?
     objects: "_VersionedKeyStore"
     versioning_status: Optional[bool]
     lifecycle_rules: LifecycleRules
@@ -114,7 +117,9 @@ class S3Bucket:
     logging: LoggingEnabled
     notification_configuration: NotificationConfiguration
     payer: Payer
-    encryption_rules: ServerSideEncryptionRules
+    encryption_rule: Optional[
+        ServerSideEncryptionRule
+    ]  # TODO validate if there can be more than one rule
     public_access_block: PublicAccessBlockConfiguration
     accelerate_status: BucketAccelerateStatus
     object_ownership: ObjectOwnership
@@ -143,6 +148,7 @@ class S3Bucket:
         # self.acl
         self.object_ownership = object_ownership
         self.object_lock_enabled = object_lock_enabled_for_bucket
+        self.encryption_rule = None  # TODO
         self.creation_date = datetime.now()
         self.multiparts = {}
         # we set the versioning status to None instead of False to be able to differentiate between a bucket which
@@ -155,7 +161,7 @@ class S3Bucket:
         self,
         key: ObjectKey,
         version_id: ObjectVersionId = None,
-        http_method: Literal["GET", "PUT"] = "GET",  # TODO: better?
+        http_method: Literal["GET", "PUT", "HEAD"] = "GET",  # TODO: better?
     ) -> "S3Object":
         """
         :param key: the Object Key
@@ -244,9 +250,9 @@ class S3Object:
         website_redirect_location: Optional[WebsiteRedirectLocation] = None,
         acl: Optional[str] = None,  # TODO
         expiry: Optional[datetime] = None,  # TODO
-        etag: Optional[ETag] = None,  # TODO: this for multipart op
         decoded_content_length: Optional[int] = None,  # TODO: this is for `aws-chunk` requests
-        parts: Optional[list[tuple[str, str]]] = None,
+        # etag: Optional[ETag] = None,  # TODO: this for multipart op
+        # parts: Optional[list[tuple[str, str]]] = None,  # TODO: maybe remove?
     ):
         self.lock = threading.RLock()
         self.key = key
@@ -271,15 +277,19 @@ class S3Object:
         self.value = create_key_storage()
         self.last_modified = datetime.now()
         self.size = 0
-        self.parts = parts
+        # self.parts = parts
 
-        if isinstance(value, KEY_STORAGE_CLASS):
-            self._set_value_from_multipart(value, etag)
-        elif decoded_content_length is not None:
-            self._set_value_from_chunked_stream(value, decoded_content_length)
-        else:
-            self._set_value_from_stream(value)
+        # TODO: clean up?
+        if value is not None:
 
+            # if isinstance(value, KEY_STORAGE_CLASS):
+            #     self._set_value_from_multipart(value, etag)
+            if decoded_content_length is not None:
+                self._set_value_from_chunked_stream(value, decoded_content_length)
+            else:
+                self._set_value_from_stream(value)
+
+    # TODO: remove this, we will manipulate the object directly from the multipart?
     def _set_value_from_multipart(self, value: KEY_STORAGE_CLASS, etag: ETag):
         self.value = value
         self.etag = etag
@@ -419,6 +429,11 @@ class S3Object:
     def expires_rfc1123(self) -> str:
         return rfc_1123_datetime(self.expires)
 
+    @property
+    def etag_header(self) -> str:
+        return f'"{self.etag}"'
+
+    # TODO: these are for returning the data to Werkzeug, allow for more control over how we return the data
     def get_body_iterator(self) -> Iterator[Body]:
         def get_stream_iterator() -> bytes:
             pos = 0
@@ -435,6 +450,7 @@ class S3Object:
 
         return get_stream_iterator()
 
+    # TODO: these are for returning the data to Werkzeug, allow for more control over how we return the data
     def get_range_body_iterator(self, range_data: ParsedRange) -> Iterator[Body]:
         def get_range_stream_iterator() -> bytes:
             pos = range_data.begin
@@ -467,12 +483,192 @@ class S3DeleteMarker:
         self.last_modified = datetime.now()
 
 
-class S3Multipart:
-    pass
-
-
 class S3Part:
-    pass
+    part_number: PartNumber
+    etag: ETag
+    value: KEY_STORAGE_CLASS
+    last_modified: datetime
+    checksum_algorithm: Optional[ChecksumAlgorithm]
+    checksum_value: Optional[str]
+    lock: threading.RLock
+
+    def __init__(
+        self,
+        part_number: PartNumber,
+        value: Optional[IO[bytes] | "PartialStream"],
+        checksum_algorithm: Optional[ChecksumAlgorithm] = None,
+        checksum_value: Optional[str] = None,
+        decoded_content_length: Optional[int] = None,
+    ):
+        self.lock = threading.RLock()
+        self.last_modified = datetime.now()
+        self.part_number = part_number
+        self.checksum_algorithm = checksum_algorithm
+        self.checksum_value = checksum_value
+        self.value = create_key_storage()
+        if decoded_content_length:
+            self._set_value_from_chunked_stream(value, decoded_content_length)
+        else:
+            self._set_value_from_stream(value)
+
+    @property
+    def etag_header(self) -> str:
+        return f'"{self.etag}"'
+
+    def _set_value_from_stream(self, value: IO[bytes] | "PartialStream"):
+        with self.lock:
+            self.value.seek(0)
+            self.value.truncate()
+            # We have 2 cases:
+            # The client gave a checksum value, we will need to compute the value and validate it against
+            # or the client have an algorithm value only and we need to compute the checksum
+            checksum = None
+            calculated_checksum = None
+            if self.checksum_algorithm:
+                checksum = get_s3_checksum(self.checksum_algorithm)
+
+            etag = hashlib.md5(usedforsecurity=False)
+
+            while data := value.read(S3_CHUNK_SIZE):
+                self.value.write(data)
+                etag.update(data)
+                if self.checksum_algorithm:
+                    checksum.update(data)
+
+            if self.checksum_algorithm:
+                calculated_checksum = base64.b64encode(checksum.digest()).decode()
+
+            # TODO: mandatory checksum value provided? same for get object
+            # only copy object wont need it
+            if self.checksum_value and self.checksum_value != calculated_checksum:
+                raise InvalidRequest(
+                    f"Value for x-amz-checksum-{self.checksum_algorithm.lower()} header is invalid."
+                )
+
+            self.etag = etag.hexdigest()
+
+            self.size = self.value.tell()
+            self.value.seek(0)
+
+    def _set_value_from_chunked_stream(self, value: IO[bytes], decoded_length: int):
+        with self.lock:
+            self.value.seek(0)
+            self.value.truncate()
+            # We have 2 cases:
+            # The client gave a checksum value, we will need to compute the value and validate it against
+            # or the client have an algorithm value only and we need to compute the checksum
+            checksum = None
+            calculated_checksum = None
+            if self.checksum_algorithm:
+                checksum = get_s3_checksum(self.checksum_algorithm)
+            etag = hashlib.md5(usedforsecurity=False)
+
+            written = 0
+            while written < decoded_length:
+                line = value.readline()
+                chunk_length = int(line.split(b";")[0], 16)
+
+                while chunk_length > 0:
+                    amount = min(chunk_length, S3_CHUNK_SIZE)
+                    data = value.read(amount)
+                    self.value.write(data)
+
+                    real_amount = len(data)
+                    chunk_length -= real_amount
+                    written += real_amount
+
+                    etag.update(data)
+                    if self.checksum_algorithm:
+                        checksum.update(data)
+
+                # remove trailing \r\n
+                value.read(2)
+
+            trailing_headers = []
+            next_line = value.readline()
+
+            if next_line:
+                try:
+                    chunk_length = int(next_line.split(b";")[0], 16)
+                    if chunk_length != 0:
+                        LOG.warning("The S3 object body didn't conform to the aws-chunk format")
+                except ValueError:
+                    trailing_headers.append(next_line.strip())
+
+                # try for trailing headers after
+                while line := value.readline():
+                    trailing_header = line.strip()
+                    if trailing_header:
+                        trailing_headers.append(trailing_header)
+
+            # look for the checksum header in the trailing headers
+            # TODO: we could get the header key from x-amz-trailer as well
+            for trailing_header in trailing_headers:
+                try:
+                    header_key, header_value = trailing_header.decode("utf-8").split(
+                        ":", maxsplit=1
+                    )
+                    if header_key.lower() == f"x-amz-checksum-{self.checksum_algorithm}".lower():
+                        self.checksum_value = header_value
+                except (IndexError, ValueError, AttributeError):
+                    continue
+
+            if self.checksum_algorithm:
+                calculated_checksum = base64.b64encode(checksum.digest()).decode()
+
+            if self.checksum_value and self.checksum_value != calculated_checksum:
+                raise InvalidRequest(
+                    f"Value for x-amz-checksum-{self.checksum_algorithm.lower()} header is invalid."
+                )
+
+            self.etag = etag.hexdigest()
+            self.size = self.value.tell()
+            self.value.seek(0)
+
+
+class S3Multipart:
+    parts: dict[PartNumber, S3Part]
+    object: S3Object
+    upload_id: MultipartUploadId
+
+    def __init__(
+        self,
+        key: ObjectKey,
+        metadata: Optional[Metadata] = None,
+        storage_class: StorageClass = StorageClass.STANDARD,
+        expires: Optional[datetime] = None,
+        expiration: Optional[datetime] = None,  # come from lifecycle
+        checksum_algorithm: Optional[ChecksumAlgorithm] = None,
+        encryption: Optional[ServerSideEncryption] = None,  # inherit bucket
+        kms_key_id: Optional[SSEKMSKeyId] = None,  # inherit bucket
+        bucket_key_enabled: bool = False,  # inherit bucket
+        lock_mode: Optional[ObjectLockMode] = None,  # inherit bucket
+        lock_legal_status: Optional[ObjectLockLegalHoldStatus] = None,  # inherit bucket
+        lock_until: Optional[datetime] = None,
+        website_redirect_location: Optional[WebsiteRedirectLocation] = None,
+        acl: Optional[str] = None,  # TODO
+        expiry: Optional[datetime] = None,  # TODO
+    ):
+        self.id = "randommultipart"  # TODO
+        self.parts = {}
+        self.object = S3Object(
+            key=key,
+            value=None,
+            metadata=metadata,
+            storage_class=storage_class,
+            expires=expires,
+            expiration=expiration,
+            checksum_algorithm=checksum_algorithm,
+            encryption=encryption,
+            kms_key_id=kms_key_id,
+            bucket_key_enabled=bucket_key_enabled,
+            lock_mode=lock_mode,
+            lock_legal_status=lock_legal_status,
+            lock_until=lock_until,
+            website_redirect_location=website_redirect_location,
+            acl=acl,
+            expiry=expiry,
+        )
 
 
 class _VersionedKeyStore(dict):  # type: ignore
@@ -647,6 +843,34 @@ class BucketCorsIndexV2:
                     cors_index[bucket_name] = bucket.cors_rules
 
         return buckets, cors_index
+
+
+class PartialStream(RawIOBase):
+    def __init__(self, base_stream: IO[bytes], range_data: ParsedRange):
+        super().__init__()
+        self._base_stream = base_stream
+        self._pos = range_data.begin
+        self._max_length = range_data.content_length
+
+    def read(self, s: int = -1) -> bytes | None:
+        self._base_stream.seek(self._pos)
+
+        if s is None or s < 0:
+            amount = self._max_length
+        else:
+            amount = min(self._max_length, s)
+
+        data = self._base_stream.read(amount)
+        if not data:
+            return b""
+        read_amount = len(data)
+        self._max_length -= read_amount
+        self._pos += read_amount
+
+        return data
+
+    def readable(self) -> bool:
+        return True
 
 
 s3_stores_v2 = AccountRegionBundle[S3StoreV2]("s3", S3StoreV2)

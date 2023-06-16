@@ -5,7 +5,7 @@ from localstack import config
 
 # from localstack.aws.api import CommonServiceException, RequestContext, ServiceException, handler
 from localstack.aws.api import RequestContext, handler
-from localstack.aws.api.s3 import (  # BucketName, CreateBucketConfiguration,; InvalidBucketName,; DeleteObjectRequest,
+from localstack.aws.api.s3 import (  # BucketName, CreateBucketConfiguration,; InvalidBucketName,; DeleteObjectRequest,; DeleteObjectsRequest,
     MFA,
     AccountId,
     Bucket,
@@ -13,11 +13,18 @@ from localstack.aws.api.s3 import (  # BucketName, CreateBucketConfiguration,; I
     BucketAlreadyOwnedByYou,
     BucketName,
     BypassGovernanceRetention,
+    ChecksumAlgorithm,
+    CopyObjectOutput,
+    CopyObjectRequest,
+    CopyObjectResult,
+    CopyPartResult,
     CreateBucketOutput,
     CreateBucketRequest,
+    CreateMultipartUploadOutput,
+    CreateMultipartUploadRequest,
+    Delete,
     DeleteObjectOutput,
     DeleteObjectsOutput,
-    DeleteObjectsRequest,
     GetObjectAttributesOutput,
     GetObjectAttributesParts,
     GetObjectAttributesRequest,
@@ -30,6 +37,7 @@ from localstack.aws.api.s3 import (  # BucketName, CreateBucketConfiguration,; I
     InvalidStorageClass,
     ListBucketsOutput,
     NoSuchBucket,
+    NoSuchUpload,
     ObjectKey,
     ObjectVersionId,
     PutObjectOutput,
@@ -38,21 +46,31 @@ from localstack.aws.api.s3 import (  # BucketName, CreateBucketConfiguration,; I
     S3Api,
     ServerSideEncryption,
     StorageClass,
+    UploadPartCopyOutput,
+    UploadPartCopyRequest,
+    UploadPartOutput,
+    UploadPartRequest,
 )
 from localstack.services.plugins import ServiceLifecycleHook
+from localstack.services.s3.constants import ARCHIVES_STORAGE_CLASSES
 from localstack.services.s3.exceptions import (
     BucketNotEmpty,
     InvalidLocationConstraint,
+    InvalidRequest,
     MalformedXML,
 )
 from localstack.services.s3.models_v2 import (
+    PartialStream,
     S3Bucket,
     S3DeleteMarker,
+    S3Multipart,
     S3Object,
+    S3Part,
     S3StoreV2,
     s3_stores_v2,
 )
 from localstack.services.s3.utils import (
+    extract_bucket_key_version_id_from_copy_source,
     get_class_attrs_from_spec_class,
     get_full_default_bucket_location,
     get_metadata_from_headers,
@@ -264,7 +282,9 @@ class S3Provider(S3Api, ServiceLifecycleHook):
 
         # TODO: validate the algo?
         checksum_algorithm = request.get("ChecksumAlgorithm")
-
+        checksum_value = (
+            request.get(f"Checksum{checksum_algorithm.upper()}") if checksum_algorithm else None
+        )
         # validate encryption values
 
         # check if chunked request
@@ -273,16 +293,14 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         else:
             decoded_content_length = None
 
-        s3_key = S3Object(
+        s3_object = S3Object(
             key=key,
             value=request.get("Body"),
             storage_class=storage_class,
             expires=request.get("Expires"),
             metadata=metadata,
             checksum_algorithm=checksum_algorithm,
-            checksum_value=request.get(f"Checksum{checksum_algorithm.upper()}")
-            if checksum_algorithm
-            else None,
+            checksum_value=checksum_value,
             encryption=request.get("ServerSideEncryption"),
             kms_key_id=request.get("SSEKMSKeyId"),
             bucket_key_enabled=request.get("BucketKeyEnabled"),
@@ -303,12 +321,12 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         # if None, version_id = None, Suspend = "null" Enabled = "random"
         if s3_bucket.versioning_status:
             # the bucket versioning is enabled, add the key to the list
-            s3_bucket.objects[key] = s3_key
-            s3_key.version_id = "something"
+            s3_bucket.objects[key] = s3_object
+            s3_object.version_id = "something"
         else:
             # the bucket never had versioning enabled, set the key
             # or the bucket has versioning disabled, just override the last version
-            s3_bucket.objects.set_last_version(key=key, value=s3_key)
+            s3_bucket.objects.set_last_version(key=key, value=s3_object)
 
         # TODO: tags: do we have tagging service or do we manually handle? see utils TaggingService
         #  add to store
@@ -329,25 +347,25 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         # BucketKeyEnabled: Optional[BucketKeyEnabled] OK
         # RequestCharged: Optional[RequestCharged]  # TODO
         response = PutObjectOutput(
-            ETag=f'"{s3_key.etag}"',
+            ETag=f'"{s3_object.etag}"',
         )
-        if s3_key.version_id:  # TODO: better way?
-            response["VersionId"] = s3_key.version_id
+        if s3_object.version_id:  # TODO: better way?
+            response["VersionId"] = s3_object.version_id
 
-        if s3_key.checksum_algorithm:
-            response[f"Checksum{checksum_algorithm.upper()}"] = s3_key.checksum_value
+        if s3_object.checksum_algorithm:
+            response[f"Checksum{checksum_algorithm.upper()}"] = s3_object.checksum_value
 
-        if s3_key.expiration:
-            response["Expiration"] = s3_key.expiration  # TODO: properly parse the datetime
+        if s3_object.expiration:
+            response["Expiration"] = s3_object.expiration  # TODO: properly parse the datetime
 
-        if s3_key.encryption:
-            response["ServerSideEncryption"] = s3_key.encryption
-            if s3_key.encryption == ServerSideEncryption.aws_kms:
-                if s3_key.kms_key_id is not None:
+        if s3_object.encryption:
+            response["ServerSideEncryption"] = s3_object.encryption
+            if s3_object.encryption == ServerSideEncryption.aws_kms:
+                if s3_object.kms_key_id is not None:
                     # TODO: see S3 AWS managed KMS key if not provided
-                    response["SSEKMSKeyId"] = s3_key.kms_key_id
-                if s3_key.bucket_key_enabled is not None:
-                    response["BucketKeyEnabled"] = s3_key.bucket_key_enabled
+                    response["SSEKMSKeyId"] = s3_object.kms_key_id
+                if s3_object.bucket_key_enabled is not None:
+                    response["BucketKeyEnabled"] = s3_object.bucket_key_enabled
 
         return response
 
@@ -486,7 +504,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         s3_object = s3_bucket.get_object(
             key=object_key,
             version_id=request.get("VersionId"),
-            http_method="GET",
+            http_method="HEAD",
         )
 
         # DeleteMarker: Optional[DeleteMarker]
@@ -616,67 +634,198 @@ class S3Provider(S3Api, ServiceLifecycleHook):
 
         return response
 
-    @handler("DeleteObjects", expand=False)
+    # @handler("DeleteObjects", expand=False)
     def delete_objects(
         self,
         context: RequestContext,
-        request: DeleteObjectsRequest,
-        # bucket: BucketName,
-        # delete: Delete,
-        # mfa: MFA = None,
-        # request_payer: RequestPayer = None,
-        # bypass_governance_retention: BypassGovernanceRetention = None,
-        # expected_bucket_owner: AccountId = None,
-        # checksum_algorithm: ChecksumAlgorithm = None,
+        # request: DeleteObjectsRequest,
+        bucket: BucketName,
+        delete: Delete,
+        mfa: MFA = None,
+        request_payer: RequestPayer = None,
+        bypass_governance_retention: BypassGovernanceRetention = None,
+        expected_bucket_owner: AccountId = None,
+        checksum_algorithm: ChecksumAlgorithm = None,
     ) -> DeleteObjectsOutput:
         pass
 
-    # def copy_object(
-    #     self,
-    #     context: RequestContext,
-    #     bucket: BucketName,
-    #     copy_source: CopySource,
-    #     key: ObjectKey,
-    #     acl: ObjectCannedACL = None,
-    #     cache_control: CacheControl = None,
-    #     checksum_algorithm: ChecksumAlgorithm = None,
-    #     content_disposition: ContentDisposition = None,
-    #     content_encoding: ContentEncoding = None,
-    #     content_language: ContentLanguage = None,
-    #     content_type: ContentType = None,
-    #     copy_source_if_match: CopySourceIfMatch = None,
-    #     copy_source_if_modified_since: CopySourceIfModifiedSince = None,
-    #     copy_source_if_none_match: CopySourceIfNoneMatch = None,
-    #     copy_source_if_unmodified_since: CopySourceIfUnmodifiedSince = None,
-    #     expires: Expires = None,
-    #     grant_full_control: GrantFullControl = None,
-    #     grant_read: GrantRead = None,
-    #     grant_read_acp: GrantReadACP = None,
-    #     grant_write_acp: GrantWriteACP = None,
-    #     metadata: Metadata = None,
-    #     metadata_directive: MetadataDirective = None,
-    #     tagging_directive: TaggingDirective = None,
-    #     server_side_encryption: ServerSideEncryption = None,
-    #     storage_class: StorageClass = None,
-    #     website_redirect_location: WebsiteRedirectLocation = None,
-    #     sse_customer_algorithm: SSECustomerAlgorithm = None,
-    #     sse_customer_key: SSECustomerKey = None,
-    #     sse_customer_key_md5: SSECustomerKeyMD5 = None,
-    #     ssekms_key_id: SSEKMSKeyId = None,
-    #     ssekms_encryption_context: SSEKMSEncryptionContext = None,
-    #     bucket_key_enabled: BucketKeyEnabled = None,
-    #     copy_source_sse_customer_algorithm: CopySourceSSECustomerAlgorithm = None,
-    #     copy_source_sse_customer_key: CopySourceSSECustomerKey = None,
-    #     copy_source_sse_customer_key_md5: CopySourceSSECustomerKeyMD5 = None,
-    #     request_payer: RequestPayer = None,
-    #     tagging: TaggingHeader = None,
-    #     object_lock_mode: ObjectLockMode = None,
-    #     object_lock_retain_until_date: ObjectLockRetainUntilDate = None,
-    #     object_lock_legal_hold_status: ObjectLockLegalHoldStatus = None,
-    #     expected_bucket_owner: AccountId = None,
-    #     expected_source_bucket_owner: AccountId = None,
-    # ) -> CopyObjectOutput:
-    #     pass
+    @handler("CopyObject", expand=False)
+    def copy_object(
+        self,
+        context: RequestContext,
+        request: CopyObjectRequest,
+        # bucket: BucketName,
+        # copy_source: CopySource,
+        # key: ObjectKey,
+        # acl: ObjectCannedACL = None,
+        # cache_control: CacheControl = None,
+        # checksum_algorithm: ChecksumAlgorithm = None,
+        # content_disposition: ContentDisposition = None,
+        # content_encoding: ContentEncoding = None,
+        # content_language: ContentLanguage = None,
+        # content_type: ContentType = None,
+        # copy_source_if_match: CopySourceIfMatch = None,
+        # copy_source_if_modified_since: CopySourceIfModifiedSince = None,
+        # copy_source_if_none_match: CopySourceIfNoneMatch = None,
+        # copy_source_if_unmodified_since: CopySourceIfUnmodifiedSince = None,
+        # expires: Expires = None,
+        # grant_full_control: GrantFullControl = None,
+        # grant_read: GrantRead = None,
+        # grant_read_acp: GrantReadACP = None,
+        # grant_write_acp: GrantWriteACP = None,
+        # metadata: Metadata = None,
+        # metadata_directive: MetadataDirective = None,
+        # tagging_directive: TaggingDirective = None,
+        # server_side_encryption: ServerSideEncryption = None,
+        # storage_class: StorageClass = None,
+        # website_redirect_location: WebsiteRedirectLocation = None,
+        # sse_customer_algorithm: SSECustomerAlgorithm = None,
+        # sse_customer_key: SSECustomerKey = None,
+        # sse_customer_key_md5: SSECustomerKeyMD5 = None,
+        # ssekms_key_id: SSEKMSKeyId = None,
+        # ssekms_encryption_context: SSEKMSEncryptionContext = None,
+        # bucket_key_enabled: BucketKeyEnabled = None,
+        # copy_source_sse_customer_algorithm: CopySourceSSECustomerAlgorithm = None,
+        # copy_source_sse_customer_key: CopySourceSSECustomerKey = None,
+        # copy_source_sse_customer_key_md5: CopySourceSSECustomerKeyMD5 = None,
+        # request_payer: RequestPayer = None,
+        # tagging: TaggingHeader = None,
+        # object_lock_mode: ObjectLockMode = None,
+        # object_lock_retain_until_date: ObjectLockRetainUntilDate = None,
+        # object_lock_legal_hold_status: ObjectLockLegalHoldStatus = None,
+        # expected_bucket_owner: AccountId = None,
+        # expected_source_bucket_owner: AccountId = None,
+    ) -> CopyObjectOutput:
+        dest_bucket = request["Bucket"]
+        dest_key = request["Bucket"]
+        store = self.get_store(context.account_id, context.region)
+        if not (dest_s3_bucket := store.buckets.get(dest_bucket)):
+            raise NoSuchBucket("The specified bucket does not exist", BucketName=dest_bucket)
+
+        src_bucket, src_key, src_version_id = extract_bucket_key_version_id_from_copy_source(
+            request.get("CopySource")
+        )
+
+        if not (src_s3_bucket := store.buckets.get(src_bucket)):
+            # TODO: validate this
+            raise NoSuchBucket("The specified bucket does not exist", BucketName=src_bucket)
+
+        # validate method not allowed?
+        src_s3_object = src_s3_bucket.get_object(key=src_key, version_id=src_version_id)
+        # TODO: validate StorageClass for ARCHIVES one
+        if src_s3_object.storage_class in ARCHIVES_STORAGE_CLASSES:
+            pass
+
+        # TODO validate order of validation
+        storage_class = request.get("StorageClass")
+        server_side_encryption = request.get("ServerSideEncryption")
+        metadata_directive = request.get("MetadataDirective")
+        website_redirect_location = request.get("WebsiteRedirectLocation")
+        if not any(
+            (
+                storage_class,
+                server_side_encryption,
+                metadata_directive == "REPLACE",
+                website_redirect_location,
+                dest_s3_bucket.encryption_rule,  # S3 will allow copy in place if the bucket has encryption configured
+            )
+        ):
+            raise InvalidRequest(
+                "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes."
+            )
+
+        metadata = get_metadata_from_headers(context.request.headers)
+        # TODO: check metadata directive?? test it
+        if metadata_directive == "UPDATE":
+            metadata = {**src_s3_object.metadata, **metadata}
+
+        # TODO test CopyObject that was created with multipart, can you query the Parts afterwards?
+        s3_object = S3Object(
+            key=dest_key,
+            value=src_s3_object.value,
+            storage_class=storage_class,
+            expires=request.get("Expires"),
+            metadata=metadata,
+            checksum_algorithm=request.get("ChecksumAlgorithm") or src_s3_object.checksum_algorithm,
+            checksum_value=None,
+            encryption=request.get("ServerSideEncryption"),  # TODO inherit from bucket
+            kms_key_id=request.get("SSEKMSKeyId"),
+            bucket_key_enabled=request.get("BucketKeyEnabled"),
+            lock_mode=request.get("ObjectLockMode"),
+            lock_legal_status=request.get("ObjectLockLegalHoldStatus"),
+            lock_until=request.get("ObjectLockRetainUntilDate"),
+            website_redirect_location=website_redirect_location,
+            expiration=None,  # TODO, from lifecycle, or should it be updated with config?
+            acl=None,
+        )
+        # Object copied from Glacier object should not have expiry
+        # TODO: verify this assumption from moto?
+
+        # TODO: set is_last for list objects
+        if existing_s3_object := dest_s3_bucket.objects.get(dest_key):
+            existing_s3_object.is_current = False
+
+        # TODO: update versioning to include None, Enabled, Suspended
+        # if None, version_id = None, Suspend = "null" Enabled = "random"
+        if dest_s3_bucket.versioning_status:
+            # the bucket versioning is enabled, add the key to the list
+            dest_s3_bucket.objects[dest_key] = s3_object
+            s3_object.version_id = "something"
+        else:
+            # the bucket never had versioning enabled, set the key
+            # or the bucket has versioning disabled, just override the last version
+            dest_s3_bucket.objects.set_last_version(key=dest_key, value=s3_object)
+
+        #     CopyObjectResult: Optional[CopyObjectResult]
+        #     ETag: Optional[ETag]
+        #     LastModified: Optional[LastModified]
+        #     ChecksumCRC32: Optional[ChecksumCRC32]
+        #     ChecksumCRC32C: Optional[ChecksumCRC32C]
+        #     ChecksumSHA1: Optional[ChecksumSHA1]
+        #     ChecksumSHA256: Optional[ChecksumSHA256]
+        #     Expiration: Optional[Expiration]
+        #     CopySourceVersionId: Optional[CopySourceVersionId]
+        #     VersionId: Optional[ObjectVersionId]
+        #     ServerSideEncryption: Optional[ServerSideEncryption]
+        #     SSECustomerAlgorithm: Optional[SSECustomerAlgorithm]
+        #     SSECustomerKeyMD5: Optional[SSECustomerKeyMD5]
+        #     SSEKMSKeyId: Optional[SSEKMSKeyId]
+        #     SSEKMSEncryptionContext: Optional[SSEKMSEncryptionContext]
+        #     BucketKeyEnabled: Optional[BucketKeyEnabled]
+        #     RequestCharged: Optional[RequestCharged]
+
+        copy_object_result = CopyObjectResult(
+            ETag=f'"{s3_object.etag}',
+            LastModified=s3_object.last_modified,
+        )
+        if s3_object.checksum_algorithm:
+            copy_object_result[
+                f"Checksum{s3_object.checksum_algorithm.upper()}"
+            ] = s3_object.checksum_value
+
+        response = CopyObjectOutput(
+            CopyObjectResult=copy_object_result,
+        )
+
+        if s3_object.version_id:  # TODO: better way?
+            response["VersionId"] = s3_object.version_id
+
+        if s3_object.expiration:
+            response["Expiration"] = s3_object.expiration  # TODO: properly parse the datetime
+
+        if s3_object.encryption:
+            response["ServerSideEncryption"] = s3_object.encryption
+            if s3_object.encryption == ServerSideEncryption.aws_kms:
+                if s3_object.kms_key_id is not None:
+                    # TODO: see S3 AWS managed KMS key if not provided
+                    response["SSEKMSKeyId"] = s3_object.kms_key_id
+                if s3_object.bucket_key_enabled is not None:
+                    response["BucketKeyEnabled"] = s3_object.bucket_key_enabled
+
+        if src_version_id:
+            response["CopySourceVersionId"] = src_version_id
+
+        return response
 
     # def list_objects(
     #     self,
@@ -780,89 +929,346 @@ class S3Provider(S3Api, ServiceLifecycleHook):
     # ) -> RestoreObjectOutput:
     #     pass
 
-    # def create_multipart_upload(
-    #     self,
-    #     context: RequestContext,
-    #     bucket: BucketName,
-    #     key: ObjectKey,
-    #     acl: ObjectCannedACL = None,
-    #     cache_control: CacheControl = None,
-    #     content_disposition: ContentDisposition = None,
-    #     content_encoding: ContentEncoding = None,
-    #     content_language: ContentLanguage = None,
-    #     content_type: ContentType = None,
-    #     expires: Expires = None,
-    #     grant_full_control: GrantFullControl = None,
-    #     grant_read: GrantRead = None,
-    #     grant_read_acp: GrantReadACP = None,
-    #     grant_write_acp: GrantWriteACP = None,
-    #     metadata: Metadata = None,
-    #     server_side_encryption: ServerSideEncryption = None,
-    #     storage_class: StorageClass = None,
-    #     website_redirect_location: WebsiteRedirectLocation = None,
-    #     sse_customer_algorithm: SSECustomerAlgorithm = None,
-    #     sse_customer_key: SSECustomerKey = None,
-    #     sse_customer_key_md5: SSECustomerKeyMD5 = None,
-    #     ssekms_key_id: SSEKMSKeyId = None,
-    #     ssekms_encryption_context: SSEKMSEncryptionContext = None,
-    #     bucket_key_enabled: BucketKeyEnabled = None,
-    #     request_payer: RequestPayer = None,
-    #     tagging: TaggingHeader = None,
-    #     object_lock_mode: ObjectLockMode = None,
-    #     object_lock_retain_until_date: ObjectLockRetainUntilDate = None,
-    #     object_lock_legal_hold_status: ObjectLockLegalHoldStatus = None,
-    #     expected_bucket_owner: AccountId = None,
-    #     checksum_algorithm: ChecksumAlgorithm = None,
-    # ) -> CreateMultipartUploadOutput:
-    #     pass
+    @handler("CreateMultipartUpload", expand=False)
+    def create_multipart_upload(
+        self,
+        context: RequestContext,
+        request: CreateMultipartUploadRequest,
+        # bucket: BucketName,
+        # key: ObjectKey,
+        # acl: ObjectCannedACL = None,
+        # cache_control: CacheControl = None,
+        # content_disposition: ContentDisposition = None,
+        # content_encoding: ContentEncoding = None,
+        # content_language: ContentLanguage = None,
+        # content_type: ContentType = None,
+        # expires: Expires = None,
+        # grant_full_control: GrantFullControl = None,
+        # grant_read: GrantRead = None,
+        # grant_read_acp: GrantReadACP = None,
+        # grant_write_acp: GrantWriteACP = None,
+        # metadata: Metadata = None,
+        # server_side_encryption: ServerSideEncryption = None,
+        # storage_class: StorageClass = None,
+        # website_redirect_location: WebsiteRedirectLocation = None,
+        # sse_customer_algorithm: SSECustomerAlgorithm = None,
+        # sse_customer_key: SSECustomerKey = None,
+        # sse_customer_key_md5: SSECustomerKeyMD5 = None,
+        # ssekms_key_id: SSEKMSKeyId = None,
+        # ssekms_encryption_context: SSEKMSEncryptionContext = None,
+        # bucket_key_enabled: BucketKeyEnabled = None,
+        # request_payer: RequestPayer = None,
+        # tagging: TaggingHeader = None,
+        # object_lock_mode: ObjectLockMode = None,
+        # object_lock_retain_until_date: ObjectLockRetainUntilDate = None,
+        # object_lock_legal_hold_status: ObjectLockLegalHoldStatus = None,
+        # expected_bucket_owner: AccountId = None,
+        # checksum_algorithm: ChecksumAlgorithm = None,
+    ) -> CreateMultipartUploadOutput:
+        store = self.get_store(context.account_id, context.region)
+        bucket_name = request["Bucket"]
+        if not (s3_bucket := store.buckets.get(bucket_name)):
+            raise NoSuchBucket("The specified bucket does not exist", BucketName=bucket_name)
 
-    # def upload_part(
-    #     self,
-    #     context: RequestContext,
-    #     bucket: BucketName,
-    #     key: ObjectKey,
-    #     part_number: PartNumber,
-    #     upload_id: MultipartUploadId,
-    #     body: IO[Body] = None,
-    #     content_length: ContentLength = None,
-    #     content_md5: ContentMD5 = None,
-    #     checksum_algorithm: ChecksumAlgorithm = None,
-    #     checksum_crc32: ChecksumCRC32 = None,
-    #     checksum_crc32_c: ChecksumCRC32C = None,
-    #     checksum_sha1: ChecksumSHA1 = None,
-    #     checksum_sha256: ChecksumSHA256 = None,
-    #     sse_customer_algorithm: SSECustomerAlgorithm = None,
-    #     sse_customer_key: SSECustomerKey = None,
-    #     sse_customer_key_md5: SSECustomerKeyMD5 = None,
-    #     request_payer: RequestPayer = None,
-    #     expected_bucket_owner: AccountId = None,
-    # ) -> UploadPartOutput:
-    #     pass
+        if (
+            storage_class := request.get("StorageClass")
+        ) is not None and storage_class not in STORAGE_CLASSES:
+            raise InvalidStorageClass(
+                "The storage class you specified is not valid", StorageClassRequested=storage_class
+            )
 
-    # def upload_part_copy(
-    #     self,
-    #     context: RequestContext,
-    #     bucket: BucketName,
-    #     copy_source: CopySource,
-    #     key: ObjectKey,
-    #     part_number: PartNumber,
-    #     upload_id: MultipartUploadId,
-    #     copy_source_if_match: CopySourceIfMatch = None,
-    #     copy_source_if_modified_since: CopySourceIfModifiedSince = None,
-    #     copy_source_if_none_match: CopySourceIfNoneMatch = None,
-    #     copy_source_if_unmodified_since: CopySourceIfUnmodifiedSince = None,
-    #     copy_source_range: CopySourceRange = None,
-    #     sse_customer_algorithm: SSECustomerAlgorithm = None,
-    #     sse_customer_key: SSECustomerKey = None,
-    #     sse_customer_key_md5: SSECustomerKeyMD5 = None,
-    #     copy_source_sse_customer_algorithm: CopySourceSSECustomerAlgorithm = None,
-    #     copy_source_sse_customer_key: CopySourceSSECustomerKey = None,
-    #     copy_source_sse_customer_key_md5: CopySourceSSECustomerKeyMD5 = None,
-    #     request_payer: RequestPayer = None,
-    #     expected_bucket_owner: AccountId = None,
-    #     expected_source_bucket_owner: AccountId = None,
-    # ) -> UploadPartCopyOutput:
-    #     pass
+        if not config.S3_SKIP_KMS_KEY_VALIDATION and (sse_kms_key_id := request.get("SSEKMSKeyId")):
+            validate_kms_key_id(sse_kms_key_id, s3_bucket)
+
+        key = request["Key"]
+        headers = context.request.headers
+
+        metadata = get_metadata_from_headers(headers)
+        # set default ContentType
+        if "ContentType" not in metadata:
+            metadata["ContentType"] = "binary/octet-stream"
+
+        # TODO: get all default from bucket, maybe extract logic
+
+        # TODO: consolidate ACL into one, and validate it
+
+        # until then, try that
+        # get checksum value from request if present
+
+        # TODO: validate the algo?
+        checksum_algorithm = request.get("ChecksumAlgorithm")
+
+        # validate encryption values
+
+        s3_multipart = S3Multipart(
+            key=key,
+            storage_class=storage_class,
+            expires=request.get("Expires"),
+            metadata=metadata,
+            checksum_algorithm=checksum_algorithm,
+            encryption=request.get("ServerSideEncryption"),
+            kms_key_id=request.get("SSEKMSKeyId"),
+            bucket_key_enabled=request.get("BucketKeyEnabled"),
+            lock_mode=request.get("ObjectLockMode"),
+            lock_legal_status=request.get("ObjectLockLegalHoldStatus"),
+            lock_until=request.get("ObjectLockRetainUntilDate"),
+            website_redirect_location=request.get("WebsiteRedirectLocation"),
+            expiration=None,  # TODO, from lifecycle, or should it be updated with config?
+            acl=None,
+        )
+
+        s3_bucket.multiparts[s3_multipart.upload_id] = s3_multipart
+
+        # TODO: tags: do we have tagging service or do we manually handle? see utils TaggingService
+        #  add to store
+
+        # TODO: fields
+        # AbortDate: Optional[AbortDate]  # TODO: lifecycle related
+        # AbortRuleId: Optional[AbortRuleId] # TODO: lifecycle related
+        # Bucket: Optional[BucketName]
+        # Key: Optional[ObjectKey]
+        # UploadId: Optional[MultipartUploadId]
+        # ServerSideEncryption: Optional[ServerSideEncryption]
+        # SSECustomerAlgorithm: Optional[SSECustomerAlgorithm]
+        # SSECustomerKeyMD5: Optional[SSECustomerKeyMD5]
+        # SSEKMSKeyId: Optional[SSEKMSKeyId]
+        # SSEKMSEncryptionContext: Optional[SSEKMSEncryptionContext]
+        # BucketKeyEnabled: Optional[BucketKeyEnabled]
+        # RequestCharged: Optional[RequestCharged]
+        # ChecksumAlgorithm: Optional[ChecksumAlgorithm]
+        response = CreateMultipartUploadOutput(
+            Bucket=bucket_name, Key=key, UploadId=s3_multipart.upload_id
+        )
+
+        if checksum_algorithm := s3_multipart.object.checksum_algorithm:
+            response["ChecksumAlgorithm"] = checksum_algorithm
+
+        if encryption := s3_multipart.object.encryption:
+            response["ServerSideEncryption"] = encryption
+            if encryption == ServerSideEncryption.aws_kms:
+                if s3_multipart.object.kms_key_id is not None:
+                    # TODO: see S3 AWS managed KMS key if not provided
+                    response["SSEKMSKeyId"] = s3_multipart.object.kms_key_id
+                if s3_multipart.object.bucket_key_enabled is not None:
+                    response["BucketKeyEnabled"] = s3_multipart.object.bucket_key_enabled
+
+        return response
+
+    @handler("UploadPart", expand=False)
+    def upload_part(
+        self,
+        context: RequestContext,
+        request: UploadPartRequest,
+        # bucket: BucketName,
+        # key: ObjectKey,
+        # part_number: PartNumber,
+        # upload_id: MultipartUploadId,
+        # body: IO[Body] = None,
+        # content_length: ContentLength = None,
+        # content_md5: ContentMD5 = None,
+        # checksum_algorithm: ChecksumAlgorithm = None,
+        # checksum_crc32: ChecksumCRC32 = None,
+        # checksum_crc32_c: ChecksumCRC32C = None,
+        # checksum_sha1: ChecksumSHA1 = None,
+        # checksum_sha256: ChecksumSHA256 = None,
+        # sse_customer_algorithm: SSECustomerAlgorithm = None,
+        # sse_customer_key: SSECustomerKey = None,
+        # sse_customer_key_md5: SSECustomerKeyMD5 = None,
+        # request_payer: RequestPayer = None,
+        # expected_bucket_owner: AccountId = None,
+    ) -> UploadPartOutput:
+        store = self.get_store(context.account_id, context.region)
+        bucket_name = request["Bucket"]
+        if not (s3_bucket := store.buckets.get(bucket_name)):
+            raise NoSuchBucket("The specified bucket does not exist", BucketName=bucket_name)
+
+        upload_id = request.get("UploadId")
+        if not (s3_multipart := s3_bucket.multiparts.get(upload_id)):
+            raise NoSuchUpload(
+                "The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.",
+                UploadId=upload_id,
+            )
+
+        # TODO: validate key?? is data model wrong??
+        if s3_multipart.object.key != request.get("Key"):
+            pass
+
+        part_number = request.get("PartNumber")
+        # TODO: validate PartNumber
+        # if part_number > 10000:
+        # raise InvalidMaxPartNumberArgument(part_number)
+
+        headers = context.request.headers
+        # check if chunked request
+        if headers.get("x-amz-content-sha256", "").startswith("STREAMING-"):
+            decoded_content_length = int(headers.get("x-amz-decoded-content-length", 0))
+        else:
+            decoded_content_length = None
+
+        checksum_algorithm = request.get("ChecksumAlgorithm")
+        checksum_value = (
+            request.get(f"Checksum{checksum_algorithm.upper()}") if checksum_algorithm else None
+        )
+
+        s3_part = S3Part(
+            part_number=part_number,
+            value=request.get("Body"),
+            checksum_algorithm=checksum_algorithm,
+            checksum_value=checksum_value,
+            decoded_content_length=decoded_content_length,
+        )
+
+        s3_multipart.parts[part_number] = s3_part
+
+        # ServerSideEncryption: Optional[ServerSideEncryption]
+        # ETag: Optional[ETag]
+        # ChecksumCRC32: Optional[ChecksumCRC32]
+        # ChecksumCRC32C: Optional[ChecksumCRC32C]
+        # ChecksumSHA1: Optional[ChecksumSHA1]
+        # ChecksumSHA256: Optional[ChecksumSHA256]
+        # SSECustomerAlgorithm: Optional[SSECustomerAlgorithm]
+        # SSECustomerKeyMD5: Optional[SSECustomerKeyMD5]
+        # SSEKMSKeyId: Optional[SSEKMSKeyId]
+        # BucketKeyEnabled: Optional[BucketKeyEnabled]
+        # RequestCharged: Optional[RequestCharged]
+        response = UploadPartOutput(
+            ETag=f'"{s3_part.etag}"',
+        )
+
+        # TODO: create helper
+        if encryption := s3_multipart.object.encryption:
+            response["ServerSideEncryption"] = encryption
+            if encryption == ServerSideEncryption.aws_kms:
+                if s3_multipart.object.kms_key_id is not None:
+                    # TODO: see S3 AWS managed KMS key if not provided
+                    response["SSEKMSKeyId"] = s3_multipart.object.kms_key_id
+                if s3_multipart.object.bucket_key_enabled is not None:
+                    response["BucketKeyEnabled"] = s3_multipart.object.bucket_key_enabled
+
+        if s3_part.checksum_algorithm:
+            response[f"Checksum{checksum_algorithm.upper()}"] = s3_part.checksum_value
+
+        return response
+
+    @handler("UploadPartCopy", expand=False)
+    def upload_part_copy(
+        self,
+        context: RequestContext,
+        request: UploadPartCopyRequest,
+        # bucket: BucketName,
+        # copy_source: CopySource,
+        # key: ObjectKey,
+        # part_number: PartNumber,
+        # upload_id: MultipartUploadId,
+        # copy_source_if_match: CopySourceIfMatch = None,
+        # copy_source_if_modified_since: CopySourceIfModifiedSince = None,
+        # copy_source_if_none_match: CopySourceIfNoneMatch = None,
+        # copy_source_if_unmodified_since: CopySourceIfUnmodifiedSince = None,
+        # copy_source_range: CopySourceRange = None,
+        # sse_customer_algorithm: SSECustomerAlgorithm = None,
+        # sse_customer_key: SSECustomerKey = None,
+        # sse_customer_key_md5: SSECustomerKeyMD5 = None,
+        # copy_source_sse_customer_algorithm: CopySourceSSECustomerAlgorithm = None,
+        # copy_source_sse_customer_key: CopySourceSSECustomerKey = None,
+        # copy_source_sse_customer_key_md5: CopySourceSSECustomerKeyMD5 = None,
+        # request_payer: RequestPayer = None,
+        # expected_bucket_owner: AccountId = None,
+        # expected_source_bucket_owner: AccountId = None,
+    ) -> UploadPartCopyOutput:
+        dest_bucket = request["Bucket"]
+        dest_key = request["Bucket"]
+        store = self.get_store(context.account_id, context.region)
+        if not (dest_s3_bucket := store.buckets.get(dest_bucket)):
+            raise NoSuchBucket("The specified bucket does not exist", BucketName=dest_bucket)
+
+        src_bucket, src_key, src_version_id = extract_bucket_key_version_id_from_copy_source(
+            request.get("CopySource")
+        )
+
+        if not (src_s3_bucket := store.buckets.get(src_bucket)):
+            # TODO: validate this
+            raise NoSuchBucket("The specified bucket does not exist", BucketName=src_bucket)
+
+        # validate method not allowed?
+        src_s3_object = src_s3_bucket.get_object(key=src_key, version_id=src_version_id)
+        # TODO: validate StorageClass for ARCHIVES one
+        if src_s3_object.storage_class in ARCHIVES_STORAGE_CLASSES:
+            pass
+
+        upload_id = request.get("UploadId")
+        if not (s3_multipart := dest_s3_bucket.multiparts.get(upload_id)):
+            raise NoSuchUpload(
+                "The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.",
+                UploadId=upload_id,
+            )
+
+        # TODO: validate key?? is data model wrong??
+        if s3_multipart.object.key != dest_key:
+            pass
+
+        part_number = request.get("PartNumber")
+        # TODO: validate PartNumber
+        # if part_number > 10000:
+        # raise InvalidMaxPartNumberArgument(part_number)
+
+        source_range = request.get("CopySourceRange")
+        # TODO implement copy source IF
+        range_data = parse_range_header(source_range, src_s3_object.size)
+
+        # TODO: PartialStream or use the Iterator??
+        range_stream = PartialStream(
+            base_stream=src_s3_object.value,
+            range_data=range_data,
+        )
+
+        s3_part = S3Part(
+            part_number=part_number,
+            value=range_stream,
+        )
+
+        s3_multipart.parts[part_number] = s3_part
+
+        #     CopySourceVersionId: Optional[CopySourceVersionId]
+        #     CopyPartResult: Optional[CopyPartResult]
+        # ETag: Optional[ETag]
+        # LastModified: Optional[LastModified]
+        # ChecksumCRC32: Optional[ChecksumCRC32]
+        # ChecksumCRC32C: Optional[ChecksumCRC32C]
+        # ChecksumSHA1: Optional[ChecksumSHA1]
+        # ChecksumSHA256: Optional[ChecksumSHA256]
+        #     ServerSideEncryption: Optional[ServerSideEncryption]
+        #     SSECustomerAlgorithm: Optional[SSECustomerAlgorithm]
+        #     SSECustomerKeyMD5: Optional[SSECustomerKeyMD5]
+        #     SSEKMSKeyId: Optional[SSEKMSKeyId]
+        #     BucketKeyEnabled: Optional[BucketKeyEnabled]
+        #     RequestCharged: Optional[RequestCharged]
+
+        result = CopyPartResult(
+            ETag=s3_part.etag_header,
+            LastModified=s3_part.last_modified,
+        )
+
+        if s3_part.checksum_algorithm:
+            result[f"Checksum{s3_part.checksum_algorithm.upper()}"] = s3_part.checksum_value
+
+        response = UploadPartCopyOutput(
+            CopyPartResult=result,
+        )
+
+        if src_version_id:
+            response["CopySourceVersionId"] = src_version_id
+
+        # TODO: create helper
+        if encryption := s3_multipart.object.encryption:
+            response["ServerSideEncryption"] = encryption
+            if encryption == ServerSideEncryption.aws_kms:
+                if s3_multipart.object.kms_key_id is not None:
+                    # TODO: see S3 AWS managed KMS key if not provided
+                    response["SSEKMSKeyId"] = s3_multipart.object.kms_key_id
+                if s3_multipart.object.bucket_key_enabled is not None:
+                    response["BucketKeyEnabled"] = s3_multipart.object.bucket_key_enabled
+
+        return response
 
     # def complete_multipart_upload(
     #     self,
