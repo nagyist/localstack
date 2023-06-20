@@ -1606,7 +1606,9 @@ class TemplateDeployer:
             },
         }
         # TODO: verify event
-        executor.deploy_loop(resource_provider_payload)
+        executor.deploy_loop(resource_provider_payload)  # noqa
+
+        # TODO: update resource state with returned state from progress event
 
         # update resource status and physical resource id
         stack_action = get_action_name_for_resource_change(action)
